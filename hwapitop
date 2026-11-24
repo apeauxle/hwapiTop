@@ -656,7 +656,7 @@ detect() {
         # the CPU-fan reading often lives in the motherboard sensor ("ЦП1"
         # on Russian boards, "CPU Fan"/"Fan #1" elsewhere), not in the CPU
         # group itself — so fall back to a global search for it
-        pick_grp 3 'CPU Fan;;^Fan;;^ЦП1$' || pick_names 3 'CPU Fan;;^Fan [0-9]?$;;^Fan$;;^ЦП1$' || true
+        pick_grp 3 'CPU Fan;;^Fan;;^ЦП1$' || pick_names 3 'CPU Fan;;^CPU[0-9]+$;;^ЦП1$;;^Fan$' || true
         i_fan=$REPLY
         # A bus clock is not what anyone means by "clock": take the core clock
         # aggregate first, then core 0, and only then fall back to the bus.
@@ -742,7 +742,16 @@ detect() {
         pick_names 1 '^Температура ГП$;;^GPU Temperature$;;^GPU Temp' "$gsen" && g_temp=$REPLY
         pick_names 1 'Температура горячей точки;;Hot ?Spot;;Hotspot' "$gsen" && g_hot=$REPLY
         pick_names 7 '^Использование ГП$;;GPU Core Load;;GPU Utilization;;^GPU Load$' "$gsen" && g_load=$REPLY
-        pick_names 5 'Общая мощность графики;;GPU Power;;Board Power' "$gsen" && g_pwr=$REPLY
+        # whole-board power first: TGP ("Общая мощность графики (TGP)" in
+        # ru) / "GPU PPT". Separate calls = priority tiers: pick_names scans
+        # rows in tree order, so one big list would let an early row (GPU
+        # ASIC Power) beat a later one (TGP) regardless of the pattern order.
+        # Rail powers (Core/Memory/SoC Power) are components, not card draw.
+        pick_names 5 'Общая мощность графики;;^Total Graphics Power' "$gsen" ||
+            pick_names 5 '^GPU PPT$' "$gsen" ||
+            pick_names 5 '^GPU Power$;;^Board Power$' "$gsen" ||
+            pick_names 5 'GPU ASIC Power' "$gsen"
+        g_pwr=$REPLY
         pick_names 3 '^GPU Вентилятор$;;GPU Fan;;^Fan$' "$gsen" && g_fan=$REPLY
         pick_names 6 '^Частота ГП$;;GPU Core Clock;;^GPU Clock$' "$gsen" && g_clk=$REPLY
         # physical VRAM only: "GPU Memory Usage" also counts shared/system
@@ -857,6 +866,7 @@ declare -A SHORTMAP=(
     ["Температура горячей точки ГП"]="hot"
     ["Использование ГП"]="load"   ["GPU Core Load"]="load"
     ["Общая мощность графики (TGP)"]="pwr" ["GPU Power"]="pwr"
+    ["Total Graphics Power (TGP)"]="TGP" ["GPU PPT"]="PPT" ["GPU ASIC Power"]="asic pwr"
     ["GPU Вентилятор"]="fan"      ["GPU Fan"]="fan"
     ["GPU Вентилятор PWM"]="fan pwm"
     ["Частота ГП"]="clk"          ["GPU Core Clock"]="clk"
@@ -912,7 +922,8 @@ declare -A SHORTMAP=(
     ["Всего хост-чтений"]="host r" ["Всего хост-записей"]="host w"
     # --- board / misc
     ["Системная плата"]="board" ["Корпус1"]="case1" ["Корпус2"]="case2"
-    ["ЦП1"]="cpu fan" ["CPU Fan"]="cpu fan" ["Fan 1"]="fan 1"
+    ["ЦП1"]="cpu fan" ["CPU Fan"]="cpu fan" ["CPU1"]="cpu fan"
+    ["Chassis1"]="case1" ["Chassis2"]="case2"
     ["Несанкционированное вскрытие корпуса"]="intrusion"
     ["Вспомогательный"]="aux" ["Частота памяти"]="mem clk"
     ["Множитель частоты памяти"]="mem ratio"
@@ -990,7 +1001,7 @@ disp_name() { # disp_name SENSOR-NAME -> REPLY = short display name
     # "dGPU [#0]: AMD Radeon RX 6700 XT: MSI ..." -> "RX 6700 XT"
     # "Drive: ADATA SE760 (429084B4600E) [E:]" -> "ADATA SE760 [E:]"
     local n=$1 re
-    re='^(ЦП|GPU|dGPU) \[#0\]: +'
+    re='^(ЦП|CPU|GPU|dGPU) \[#0\]: +'
     [[ $n =~ $re ]] && n=${n:${#BASH_REMATCH[0]}}
     re='^(Drive|S\.M\.A\.R\.T\.): +'
     [[ $n =~ $re ]] && n=${n:${#BASH_REMATCH[0]}}
