@@ -1,0 +1,2000 @@
+#!/usr/bin/env bash
+# hwapiTop - a btop-style terminal monitor for the HWiNFO sensor REST API.
+#
+#   ./hwapitop --url 192.168.1.50
+#   ./hwapitop --url http://192.168.1.50:8080 --interval 2
+#   ./hwapitop --url 192.168.1.50 --once     one snapshot, no TUI
+#   ./hwapitop --url 192.168.1.50 --list     dump the sensor table
+#
+# The HWiNFO REST API separates static description from live values:
+#   GET /api/sensors/sdb   sensor tree + units + tooltips (load once)
+#   GET /api/sensors/read  values only, polled
+#   GET /api/ping          reachability + RTT
+# Every JSON carries a root "Version" (currently 1) that must be checked.
+#
+# The API omits a reading that HWiNFO is not monitoring (hidden, or monitoring
+# paused) instead of reporting a stale value, so a missing reading is shown as
+# -- and never carried over from the previous poll. After three failed polls
+# in a row every reading is dropped and the header switches to NO DATA, so a
+# frozen frame can never be mistaken for a live one.
+#
+# Keys (TUI): q quit | p pause | + - interval | r reload sensor db | h help
+# Requires: bash >= 4.3, curl, jq.
+
+set -uo pipefail
+shopt -s extglob
+
+# Parsing and formatting must be locale independent: with LC_NUMERIC=ru_RU
+# printf both emits "48,6" and rejects "48.6" as an argument. The API always
+# uses '.' as the decimal separator in its JSON numbers, and reading values
+# are parsed after stripping display separators.
+export LC_NUMERIC=C
+
+APP="hwinfoTop"
+VER="0.0.1"
+
+# ------------------------------------------------------------------ options
+URL_ARG=""
+INTERVAL=2                 # CLI form, seconds (integer or 0.1-steps below 1)
+INT_MS=2000                # internal poll period, milliseconds
+TIMEOUT=5
+VERIFY_TLS=0
+MODE="tui"                 # tui | once | list | render
+RENDER_SPEC=""
+PAUSED=0
+NO_COLOR_ENV=${NO_COLOR:-}
+
+usage() {
+    cat <<EOF
+$APP $VER - monitor a HWiNFO REST API server in the terminal
+
+usage: $APP --url <host> [options]
+
+  --url <host>        server address: 192.168.1.50 | 192.168.1.50:8080 |
+                      http://host:port | https://host:port
+                      Without a scheme https:// is tried first, then http://,
+                      because HWiNFO serves a self-signed certificate by default.
+                      A missing port means 8080.
+  -i, --interval <s>  poll interval in seconds; fractional values (0.1 .. 0.9)
+                      poll in 100ms steps (default $INTERVAL; the sensor source
+                      itself updates about every 2 s)
+  -t, --timeout <s>   per-request timeout in seconds (default $TIMEOUT)
+      --verify        verify the TLS certificate (default: accept self-signed)
+      --once          print one snapshot and exit (no TUI, works without a tty)
+      --list          print the sensor table (name, type, value, unit) and exit
+      --no-color      disable colors
+  -h, --help          this help
+
+keys in the TUI:  q quit   p pause   + - interval   r reload sensors   h help
+
+examples:
+  $APP --url 192.168.1.50
+  $APP --url 192.168.1.50:8080 --interval 3
+  $APP --url http://192.168.1.50:8080 --once
+
+EOF
+}
+
+while (($#)); do
+    case $1 in
+        --url)        URL_ARG=${2:-}; shift 2 2>/dev/null || shift ;;
+        --url=*)      URL_ARG=${1#*=}; shift ;;
+        -i|--interval) INTERVAL=${2:-2}; shift 2 2>/dev/null || shift ;;
+        -i=*|--interval=*) INTERVAL=${1#*=}; shift ;;
+        -t|--timeout) TIMEOUT=${2:-5}; shift 2 2>/dev/null || shift ;;
+        -t=*|--timeout=*) TIMEOUT=${1#*=}; shift ;;
+        --verify)     VERIFY_TLS=1; shift ;;
+        --once)       MODE=once; shift ;;
+        --list)       MODE=list; shift ;;
+        --no-color)   NO_COLOR_ENV=1; shift ;;
+        --render)     MODE=render; RENDER_SPEC=${2:-80x24}; shift 2 2>/dev/null || shift ;;
+        -h|--help)    usage; exit 0 ;;
+        *) printf '%s: unknown argument %s (see --help)\n' "$APP" "$1" >&2; exit 2 ;;
+    esac
+done
+
+# interval: seconds, fractional allowed below 1 (100 ms granularity).
+# Stored internally as integer milliseconds so +/- and the scheduler stay exact.
+if [[ $INTERVAL =~ ^([0-9]+)(\.([0-9]+))?$ ]]; then
+    INT_MS=$(( ${BASH_REMATCH[1]} * 1000 ))
+    if [[ -n ${BASH_REMATCH[3]:-} ]]; then
+        dec="1${BASH_REMATCH[3]}"      # 1-prefix kills the octal trap
+        dec=${dec:0:4}
+        while (( ${#dec} < 4 )); do dec+="0"; done
+        INT_MS=$(( INT_MS + dec - 1000 ))
+    fi
+else
+    INTERVAL=2; INT_MS=2000
+fi
+((INT_MS < 100))   && INT_MS=100
+((INT_MS > 60000)) && INT_MS=60000
+INTERVAL=$(printf '%d.%03d' $(( INT_MS / 1000 )) $(( INT_MS % 1000 )))
+INTERVAL=${INTERVAL%.000}
+[[ $TIMEOUT =~ ^[0-9]+$ ]] || TIMEOUT=5
+
+if [[ -z $URL_ARG ]]; then
+    printf '%s: --url <host> is required (try --help)\n' "$APP" >&2
+    exit 2
+fi
+for dep in curl jq; do
+    command -v "$dep" >/dev/null 2>&1 || { printf '%s: %s is required\n' "$APP" "$dep" >&2; exit 1; }
+done
+
+# ------------------------------------------------------------------- colors
+if [[ -n $NO_COLOR_ENV ]]; then
+    E=""; BOLD=""; R=""
+    C_BRD=""; C_TTL=""; C_LBL=""; C_VAL=""; C_DIM=""; C_OK=""; C_WARN=""; C_BAD=""; C_ACC=""; C_ACC2=""
+else
+    E=$'\033' BOLD=$'\033[1m' R=$'\033[0m'
+    C_BRD=$'\033[38;5;240m'
+    C_TTL=$'\033[1;38;5;51m'
+    C_LBL=$'\033[38;5;245m'
+    C_VAL=$'\033[38;5;253m'
+    C_DIM=$'\033[38;5;239m'
+    C_OK=$'\033[38;5;48m'
+    C_WARN=$'\033[38;5;220m'
+    C_BAD=$'\033[38;5;203m'
+    C_ACC=$'\033[38;5;45m'
+    C_ACC2=$'\033[38;5;213m'
+fi
+
+# ------------------------------------------------------------- text helpers
+E_PAD=$(printf '%200s' '')
+rep() { # rep CHAR N -> REPLY (N copies of CHAR)
+    local c=$1 n=$2
+    ((n < 0)) && n=0
+    ((n > 200)) && n=200
+    REPLY=${E_PAD:0:n}
+    REPLY=${REPLY// /$c}
+}
+
+vislen() { # vislen TEXT -> VLEN visible column count (ANSI and wide-char aware)
+    local s=$1 chars=() n=0 w c
+    if [[ -z $NO_COLOR_ENV ]]; then s=${s//$E\[*([0-9;])m/}; fi
+    if [[ $s != *[!\ -~]* ]]; then VLEN=${#s}; return 0; fi   # fast path: pure ASCII
+    # UTF-8: count code points, charge 2 columns for wide (CJK, box/block, emoji)
+    while IFS= read -r -d '' c; do
+        case $c in
+            ─|│|┌|┐|└|┘|├|┤) n=$((n + 1)) ;;
+            █|░|▁|▂|▃|▄|▅|▆|▇) n=$((n + 1)) ;;
+            *) n=$((n + 1)) ;;
+        esac
+    done < <(printf '%s' "$s" | while IFS= read -r -n1 c; do printf '%s\0' "$c"; done)
+    VLEN=$n
+}
+
+fit() { # fit TEXT WIDTH -> REPLY exactly WIDTH visible columns (truncates if needed)
+    local s=$1 w=$2 plain
+    if [[ -z $NO_COLOR_ENV ]]; then plain=${s//$E\[*([0-9;])m/}; else plain=$s; fi
+    if ((${#plain} <= w)); then
+        rep ' ' $((w - ${#plain}))
+        REPLY="$s$REPLY"
+        return 0
+    fi
+    local c out="" n=0
+    while IFS= read -r -n1 c && ((n < w)); do
+        out+=$c; n=$((n + 1))
+    done <<<"$plain"
+    REPLY=$out
+}
+
+trunc() { # trunc TEXT WIDTH -> REPLY plain text, at most WIDTH chars, '~' marks a cut
+    local s=$1 w=$2
+    if ((${#s} <= w)); then REPLY=$s
+    elif ((w <= 0)); then REPLY=""
+    elif ((w == 1)); then REPLY=${s:0:1}
+    else REPLY="${s:0:w-1}~"
+    fi
+}
+
+bar() { # bar PERCENT WIDTH -> REPLY colored bar, exactly WIDTH cells
+    local p=$1 w=$2 f col full empty
+    ((w < 1)) && { REPLY=""; return 0; }
+    ((p < 0)) && p=0
+    ((p > 100)) && p=100
+    f=$(( (p * w + 50) / 100 ))
+    ((f > w)) && f=w
+    pct_color "$p"; col=$REPLY
+    rep '█' "$f"; full=$REPLY
+    rep '░' $((w - f)); empty=$REPLY
+    REPLY="${col}${full}${C_DIM}${empty}${R}"
+}
+
+clk_fmt() { # clk_fmt VALUE -> REPLY compact clock ("4.69G" / "498M")
+    # Frequency columns are the tightest part of a core row, so GHz is spelled
+    # with a single letter; the unit is consistent across the whole grid.
+    local v=${1//,/}
+    REPLY=$1
+    [[ $v =~ ^([0-9]+)(\.[0-9]*)?$ ]] || return 0
+    local whole=${BASH_REMATCH[1]}
+    local frac=${BASH_REMATCH[2]:-}
+    if ((whole >= 1000)); then
+        # 4691 -> "4.69G": whole GHz plus two decimals of MHz
+        local ghz=$(( whole / 1000 ))
+        local d1=$(( (whole / 100) % 10 ))
+        local d2=$(( (whole / 10) % 10 ))
+        REPLY="${ghz}.${d1}${d2}G"
+    else
+        REPLY="${whole}M"
+    fi
+}
+
+temp_bar() { # temp_bar DEGC WIDTH -> REPLY bar spanning T_LO..T_HI
+    # A temperature bar on a 0..100 scale is wrong for a CPU: idling at 45 C
+    # would fill nearly half the bar and 100 C would not look alarming. The
+    # bar therefore spans the same -10..120 range as the colour ramp, so the
+    # fill position and the colour tell the same story.
+    local t=${1%.*} w=$2 f col full empty
+    ((w < 1)) && { REPLY=""; return 0; }
+    [[ $t =~ ^-?[0-9]+$ ]] || { rep '░' "$w"; REPLY="${C_DIM}${REPLY}${R}"; return 0; }
+    ((t < T_LO)) && t=$T_LO
+    ((t > T_HI)) && t=$T_HI
+    f=$(( (t - T_LO) * w / (T_HI - T_LO) ))
+    ((f > w)) && f=w
+    temp_color "$t"; col=$REPLY
+    rep '█' "$f"; full=$REPLY
+    rep '░' $((w - f)); empty=$REPLY
+    REPLY="${col}${full}${C_DIM}${empty}${R}"
+}
+
+pct_color() {
+    if (($1 >= 85)); then REPLY=$C_BAD
+    elif (($1 >= 65)); then REPLY=$C_WARN
+    else REPLY=$C_OK; fi
+}
+T_LO=-10   # cold end of the temperature ramp, degrees C
+T_HI=120   # hot end, degrees C
+
+temp_color() { # temp_color DEGC -> REPLY 256-colour for that temperature
+    # A smooth ramp reads a trace at a glance where three bands do not. Below
+    # T_LO it stays at the coldest blue and above T_HI at the hottest red, so
+    # an out-of-range probe cannot throw the scale off.
+    #
+    # Anchors are interpolated rather than stepped: a three-band version made
+    # everything from 60 to 90 C the same yellow, which is exactly the range a
+    # hot core lives in and so the part worth telling apart.
+    local t=${1%.*} pos r g b
+    [[ $t =~ ^-?[0-9]+$ ]] || t=0
+    ((t < T_LO)) && t=$T_LO
+    ((t > T_HI)) && t=$T_HI
+    pos=$(( (t - T_LO) * 100 / (T_HI - T_LO) ))     # 0..100 along the ramp
+
+    # anchor positions and their colours (blue, cyan, green, yellow, red)
+    local -a ap=( 0 18 40 62 82 100 )
+    local -a ar=( 0  0  0  90 255 255 )
+    local -a ag=( 40 190 235 255 210  20 )
+    local -a ab=( 255 255 120  0   0   0 )
+
+    local k=0 span p0 p1 fr
+    for ((k = 0; k < ${#ap[@]} - 1; k++)); do
+        ((pos >= ap[k] && pos <= ap[k + 1])) && break
+    done
+    ((k >= ${#ap[@]} - 1)) && k=$((${#ap[@]} - 2))
+    p0=${ap[k]}; p1=${ap[k + 1]}
+    span=$(( p1 - p0 ))
+    ((span < 1)) && span=1
+    fr=$(( (pos - p0) * 100 / span ))               # 0..100 inside the segment
+    r=$(( ar[k] + (ar[k + 1] - ar[k]) * fr / 100 ))
+    g=$(( ag[k] + (ag[k + 1] - ag[k]) * fr / 100 ))
+    b=$(( ab[k] + (ab[k + 1] - ab[k]) * fr / 100 ))
+
+    # the 16..231 cube holds 6 steps per channel: scale 0..255 onto 0..5
+    r=$(( (r * 5 + 127) / 255 ))
+    g=$(( (g * 5 + 127) / 255 ))
+    b=$(( (b * 5 + 127) / 255 ))
+    REPLY=$'\033[38;5;'$(( 16 + 36 * r + 6 * g + b ))'m'
+}
+
+num_color() { # num_color TYPE VALUE -> REPLY
+    case $1 in
+        1) temp_color "$2" ;;
+        7) pct_color "$2" ;;
+        *) REPLY=$C_VAL ;;
+    esac
+}
+
+toint() { # toint STRING -> REPLY integer, 0 when not numeric
+    local v=${1//,/}
+    if [[ $v =~ ^(-?[0-9]+)(\.[0-9]*)?$ ]]; then REPLY=$((10#${BASH_REMATCH[1]}))
+    else REPLY=0; fi
+}
+
+fmtval() { # fmtval VALUE DIGITS -> REPLY formatted number; empty string when not numeric
+    local v=${1//,/} d=${2:-1}
+    if [[ $v =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+        printf -v REPLY "%.${d}f" "$v"
+    else REPLY=""; fi
+}
+
+# ---------------------------------------------------------------- box panels
+# Panels are line arrays built by the build_* functions. Every helper below
+# appends exactly one full-width line, so a panel is just a sequence of them.
+P_W=0
+P_LINES=()
+
+p_start() { # TITLE
+    local t=" $1 "
+    if ((${#t} > P_W - 3)); then trunc "$1" $((P_W - 4)); t=" $REPLY "; fi
+    rep '─' $(( P_W - 3 - ${#t} ))
+    P_LINES+=("${C_BRD}┌─${C_TTL}${t}${C_BRD}${REPLY}┐${R}")
+}
+p_row() { # CONTENT
+    fit "$1" $(( P_W - 2 ))
+    P_LINES+=("${C_BRD}│${R}${REPLY}${C_BRD}│${R}")
+}
+p_blank() { p_row ""; }
+p_rule() { # TITLE
+    local t=${1:-} iw=$(( P_W - 2 ))
+    if [[ -n $t ]]; then
+        rep '─' $(( iw - ${#t} - 2 ))
+        p_row "${C_DIM}─${C_LBL}${t}${C_DIM}${REPLY}─${R}"
+    else
+        rep '─' "$iw"
+        P_LINES+=("${C_BRD}├${REPLY}┤${R}")
+    fi
+}
+p_end() {
+    rep '─' $(( P_W - 2 ))
+    P_LINES+=("${C_BRD}└${REPLY}┘${R}")
+}
+p_finish() { # HEIGHT: pad or clip the panel so it has exactly HEIGHT lines
+    local h=$1
+    while ((${#P_LINES[@]} < h - 1)); do p_blank; done
+    if ((${#P_LINES[@]} > h - 1)); then P_LINES=("${P_LINES[@]:0:h-1}"); fi
+    p_end
+}
+
+# reading accessors (indices may be -1 meaning "not present")
+val_of() {
+    if (($1 >= 0 && $1 < ${#S_VAL[@]})); then REPLY=${S_VAL[$1]}; else REPLY=""; fi
+}
+unit_of() {
+    if (($1 >= 0 && $1 < ${#S_UNI[@]})); then REPLY=${S_UNI[$1]}; else REPLY=""; fi
+}
+
+# ---------------------------------------------------------------- terminal
+H=24 W=80
+get_size() {
+    local s
+    s=$(stty size 2>/dev/null)
+    if [[ $s =~ ^([0-9]+)[[:space:]]+([0-9]+)$ ]]; then
+        H=${BASH_REMATCH[1]} W=${BASH_REMATCH[2]}
+    else
+        W=$(tput cols 2>/dev/null || echo 80)
+        H=$(tput lines 2>/dev/null || echo 24)
+    fi
+    [[ $W =~ ^[0-9]+$ ]] || W=80
+    [[ $H =~ ^[0-9]+$ ]] || H=24
+    ((W < 40)) && W=40
+    ((H < 12)) && H=12
+}
+
+# ------------------------------------------------------------------ http
+TMPD=$(mktemp -d "${TMPDIR:-/tmp}/hwapitop.XXXXXX") || { echo "$APP: no temp dir" >&2; exit 1; }
+BODY_FILE="$TMPD/body" ERR_FILE="$TMPD/err" READ_JSON="$TMPD/read.json" SDB_JSON="$TMPD/sdb.json"
+cleanup_tmp() { [[ -d $TMPD ]] && rm -rf -- "$TMPD"; }
+
+BASE_URL="" HTTP_CODE=000 CONN_ERR="" CONN_RC="" BODY=""
+api_get() { # PATH -> 0 on transport success; BODY, HTTP_CODE set
+    local path=$1 rc
+    local -a opts=(-sS -m "$TIMEOUT" -o "$BODY_FILE" -w '%{http_code}' -H 'Accept: application/json')
+    ((VERIFY_TLS == 0)) && opts+=(-k)
+    HTTP_CODE=$(curl "${opts[@]}" "${BASE_URL}${path}" 2>"$ERR_FILE"); rc=$?
+    if ((rc != 0)); then
+        CONN_RC=$rc
+        CONN_ERR=$(tr '\n' ' ' <"$ERR_FILE"); CONN_ERR=${CONN_ERR#[0-9]*- }
+        [[ -z $CONN_ERR ]] && CONN_ERR="curl error $rc"
+        HTTP_CODE=000 BODY=""
+        return 1
+    fi
+    BODY=$(<"$BODY_FILE")
+    return 0
+}
+
+CANDIDATES=()
+normalize_url() {
+    local u=$1 scheme rest host port
+    CANDIDATES=()
+    if [[ $u == http://* || $u == https://* ]]; then
+        scheme=${u%%://*}; rest=${u#*://}; rest=${rest%/}
+        if [[ $rest == *:* ]]; then CANDIDATES=("${scheme}://${rest}")
+        else CANDIDATES=("${scheme}://${rest}:8080"); fi
+        return
+    fi
+    u=${u%/}
+    if [[ $u == *:* ]]; then host=${u%%:*} port=${u##*:}; else host=$u port=8080; fi
+    CANDIDATES=("https://${host}:${port}" "http://${host}:${port}")
+}
+
+CONNECT_ERR=""
+connect() {
+    local c
+    normalize_url "$URL_ARG"
+    for c in "${CANDIDATES[@]}"; do
+        BASE_URL=$c
+        if api_get /api/ping && [[ $HTTP_CODE == 200 ]] && [[ $BODY == *'"pong"'* ]]; then
+            return 0
+        fi
+        CONNECT_ERR=${CONN_ERR:-HTTP $HTTP_CODE}
+    done
+    BASE_URL=${CANDIDATES[0]}
+    return 1
+}
+
+# ------------------------------------------------------------ sensor table
+# parallel arrays, one entry per reading
+declare -a S_SEN=() S_NAM=() S_TYP=() S_VAL=() S_UNI=() 
+SRV_VER="" STALE=0 LAST_ERR="" READ_RTT=0 READ_AGE=0
+POLLS=0 LINE_LOST=0
+LAST_OK=0
+
+load_sdb() {
+    if ! api_get /api/sensors/sdb; then
+        LAST_ERR="sdb: ${CONN_ERR}"; return 1
+    fi
+    if [[ $HTTP_CODE != 200 ]]; then
+        LAST_ERR="sdb: HTTP $HTTP_CODE ${BODY:0:60}"; return 1
+    fi
+    local v
+    v=$(jq -r 'if has("Version") then .Version else "missing" end' <<<"$BODY" 2>/dev/null)
+    if [[ $v != 1 ]]; then
+        LAST_ERR="sdb: unsupported Version '$v'"; return 1
+    fi
+    printf '%s' "$BODY" >"$SDB_JSON"
+    return 0
+}
+
+poll_read() {
+    if ! api_get /api/sensors/read; then
+        ((LINE_LOST++)); STALE=1; LAST_ERR="read: ${CONN_ERR}"; return 1
+    fi
+    case $HTTP_CODE in
+        200) LINE_LOST=0 ;;
+        503) STALE=1; LAST_ERR="read: 503 ${BODY:0:70}"; ((LINE_LOST++)); return 1 ;;
+        *)   STALE=1; LAST_ERR="read: HTTP $HTTP_CODE ${BODY:0:50}"; ((LINE_LOST++)); return 1 ;;
+    esac
+    printf '%s' "$BODY" >"$READ_JSON"
+
+    local v
+    v=$(jq -r 'if has("Version") then .Version else "missing" end' "$READ_JSON" 2>/dev/null)
+    if [[ $v != 1 ]]; then
+        STALE=1; LAST_ERR="read: unsupported Version '$v'"; return 1
+    fi
+    SRV_VER=$v
+
+    local tsv
+    tsv=$(jq -r --slurpfile sdb "$SDB_JSON" '
+        ($sdb[0] // {}) as $s
+        | paths(objects | select(has("Value"))) as $p
+        | ($p[-1] | tostring) as $last
+        | ($p[-2] | tostring) as $prev
+        | ([$last] | inside(["0","1","2","3","4","5","6","7","8"])) as $typed
+        | [ ($p[0] | tostring),
+            (if $typed then $prev else $last end),
+            (if $typed then $last else "0" end),
+            (getpath($p).Value | tostring),
+            ((try ($s | getpath($p) | .Unit) catch null) // "") ]
+        | @tsv' "$READ_JSON" 2>"$ERR_FILE") || {
+            STALE=1; LAST_ERR="parse: $(head -c 120 "$ERR_FILE" | tr '\n' ' ')"; return 1
+        }
+
+    S_SEN=() S_NAM=() S_TYP=() S_VAL=() S_UNI=()
+    local sen nam typ val uni
+    while IFS=$'\t' read -r sen nam typ val uni; do
+        [[ -z $sen ]] && continue
+        # sdb units follow the install language ("МБ", "В", "МГц"); the UI is
+        # English-only, so translate the known ones at intake
+        case $uni in
+            МБ) uni=MB ;; ГБ) uni=GB ;; МГц) uni=MHz ;; ГГц) uni=GHz ;;
+            В)  uni=V  ;; об/мин) uni=RPM ;; °С|°C) uni=°C ;;
+        esac
+        S_SEN+=("$sen") S_NAM+=("$nam") S_TYP+=("$typ") S_VAL+=("$val") S_UNI+=("$uni")
+    done < <(printf '%s\n' "$tsv")
+
+    READ_RTT=$(jq -r '((.Timestamp ms // 0) - (.Timestamp RS ms // 0)) | if . > 0 then (.|floor) else 0 end' "$READ_JSON" 2>/dev/null)
+    [[ $READ_RTT =~ ^[0-9]+$ ]] || READ_RTT=0
+    LAST_OK=$(date +%s)
+    STALE=0 LAST_ERR=""
+    ((POLLS++))
+    return 0
+}
+
+# -------------------------------------------------------------- detection
+# Overview slots. Sensor names differ per machine, so match on reading names
+# and reading types, preferring the sensor that looks like the CPU/GPU.
+D_CPU="" 
+i_temp=-1 i_use=-1 i_pwr=-1 i_fan=-1 i_clk=-1
+g_temp=-1 g_hot=-1 g_load=-1 g_pwr=-1 g_fan=-1 g_clk=-1 g_mu=-1 g_mt=-1
+m_used=-1 m_total=-1 m_load=-1
+v_used=-1 v_total=-1 v_load=-1
+n_dn=-1 n_up=-1
+# Per-core values are kept as display strings, aligned by position with CTK
+# (the vector of core numbers). Detection guarantees the three arrays are the
+# same length, so the renderer cannot fall out of step with itself.
+declare -a CT=() CTK=() CU=() CK=() CPUS=()
+declare -a USED=()
+
+find_idx() { # TYPE_RE NAME_RE [SENSOR_EXACT] -> REPLY index or -1
+    local tr=$1 nr=$2 sr=${3:-} i
+    for i in "${!S_NAM[@]}"; do
+        [[ ${S_TYP[i]} =~ ^($tr)$ ]] || continue
+        [[ ${S_NAM[i]} =~ $nr ]] || continue
+        if [[ -n $sr && ${S_SEN[i]} != "$sr" ]]; then continue; fi
+        REPLY=$i; return 0
+    done
+    REPLY=-1; return 1
+}
+
+# HWiNFO localises reading names, so English patterns alone miss every sensor
+# on a non-English install (a Russian one reports "Общая загрузка ЦП" where an
+# English one says "Total CPU Usage"). These helpers add a second way to find a
+# reading: an explicit list of name variants, plus positional lookup on the SDB
+# order for names that have no stable wording at all.
+find_names() { # find_idx_names TYPE_RE 'RE1|RE2|RE3' [SENSOR_EXACT]
+    local tr=$1 list=$2 sr=${3:-} pat i
+    local -a pats
+    IFS=';' read -r -a pats <<<"$list"
+    for i in "${!S_NAM[@]}"; do
+        [[ ${S_TYP[i]} =~ ^($tr)$ ]] || continue
+        if [[ -n $sr && ${S_SEN[i]} != "$sr" ]]; then continue; fi
+        for pat in "${pats[@]}"; do
+            [[ -z $pat ]] && continue
+            if [[ ${S_NAM[i]} =~ $pat ]]; then REPLY=$i; return 0; fi
+        done
+    done
+    REPLY=-1; return 1
+}
+pick_names() { # pick_names TYPE_RE 'RE1|RE2' [SENSOR] -> REPLY idx, marks used
+    find_names "$1" "$2" "${3:-}" || return 1
+    USED+=("$REPLY")
+    return 0
+}
+pick_or() { # pick_or TYPE_RE 'RE1|RE2' [SENSOR] -> REPLY idx (first match wins)
+    pick_names "$1" "$2" "${3:-}" && return 0
+    pick "$1" "$2" "${3:-}" && return 0
+    return 1
+}
+
+core_num() { # core_num NAME -> CNUM core index, or empty when the name has none
+    local n=$1
+    # "Core 5", "Core 5 Clock", "P-core 3 Usage", "CPU Core 7"
+    [[ $n =~ (^|[^0-9])([0-9]+) ]] || { CNUM=""; return 1; }
+    CNUM=$((10#${BASH_REMATCH[2]}))
+    return 0
+}
+
+find_all() { # TYPE_RE NAME_RE [SENSOR_EXACT] -> indices, one per line
+    local tr=$1 nr=$2 sr=${3:-} i
+    for i in "${!S_NAM[@]}"; do
+        [[ ${S_TYP[i]} =~ ^($tr)$ ]] || continue
+        [[ ${S_NAM[i]} =~ $nr ]] || continue
+        if [[ -n $sr && ${S_SEN[i]} != "$sr" ]]; then continue; fi
+        printf '%s\n' "$i"
+    done
+}
+
+pick() { # pick TYPE_RE NAME_RE [SENSOR_EXACT] -> REPLY idx, marks used
+    find_idx "$1" "$2" "${3:-}" || return 1
+    USED+=("$REPLY")
+    return 0
+}
+
+CORE_RE='[Cc]ore[[:space:]]*([0-9]+)'
+
+in_group() { # in_group SENSOR -> 0 when the sensor is part of the CPU group
+    local g
+    for g in "${CPUS[@]}"; do [[ $1 == "$g" ]] && return 0; done
+    return 1
+}
+
+pick_grp() { # pick_grp TYPE_RE 'RE1|RE2' -> REPLY idx inside the CPU group
+    local tr=$1 list=$2 pat i
+    local -a pats
+    IFS=';' read -r -a pats <<<"$list"
+    for i in "${!S_NAM[@]}"; do
+        [[ ${S_TYP[i]} =~ ^($tr)$ ]] || continue
+        in_group "${S_SEN[i]}" || continue
+        for pat in "${pats[@]}"; do
+            [[ -z $pat ]] && continue
+            if [[ ${S_NAM[i]} =~ $pat ]]; then USED+=("$i"); REPLY=$i; return 0; fi
+        done
+    done
+    REPLY=-1; return 1
+}
+
+detect() {
+    D_CPU="" i_temp=-1 i_use=-1 i_pwr=-1 i_fan=-1 i_clk=-1 i_vcore=-1
+    g_temp=-1 g_hot=-1 g_load=-1 g_pwr=-1 g_fan=-1 g_clk=-1 g_mu=-1 g_mt=-1
+    m_used=-1 m_avail=-1 m_total=-1 m_load=-1
+    v_used=-1 v_avail=-1 v_total=-1 v_load=-1 V_TOTAL_V=0
+    s_used=-1 s_total=-1 s_load=-1 M_TOTAL_V=0
+    n_dn=-1 n_up=-1
+    CT=() CTK=() CU=() CK=() USED=() CPUS=()
+
+    # ---- which sensor is the CPU? score by tell-tale readings.
+    # Reading names are localised, so every pattern here has an English and a
+    # Russian form; an English-only pattern finds nothing on a Russian HWiNFO.
+    local -A score=() i s
+    for i in "${!S_SEN[@]}"; do
+        s=${S_SEN[i]}
+        [[ $s =~ ^(GPU|dGPU|.*NVIDIA.*|.*Radeon.*|.*Graphics.*) ]] && continue
+        [[ ${S_NAM[i]} =~ (Total CPU Usage|CPU Total Usage|CPU Utilization|Общая загрузка ЦП) ]] && score[$s]=$(( ${score[$s]:-0} + 10 ))
+        [[ ${S_NAM[i]} =~ (CPU Package|Tctl|Tdie|CPU Temperature|ЦП \(Tctl) ]]           && score[$s]=$(( ${score[$s]:-0} + 6 ))
+        [[ ${S_NAM[i]} =~ (Core Clock|Core VID|CPU Core Voltage|Напряжение ядра|Частота ядер) ]] && score[$s]=$(( ${score[$s]:-0} + 3 ))
+    done
+    local best=-1
+    for s in "${!score[@]}"; do
+        if (( ${score[$s]} > best )); then best=${score[$s]}; D_CPU=$s; fi
+    done
+    ((best <= 0)) && D_CPU=""
+
+    # ---- every sensor belonging to that CPU. HWiNFO splits extra readings
+    # ("Enhanced", "C-State") into their own sub-sensors, and a given reading
+    # may live in any of them, so per-core data must be gathered across all.
+    CPUS=()
+    if [[ -n $D_CPU ]]; then
+        local base=$D_CPU
+        local sub_re='^(.*[^:]) *: +(Enhanced|C-State.*|Power|Clocks?|Voltages?)$'
+        [[ $base =~ $sub_re ]] && base=${BASH_REMATCH[1]}
+        local seen=" "
+        for i in "${!S_SEN[@]}"; do
+            s=${S_SEN[i]}
+            [[ $s == "$base" || $s == "$base":* ]] || continue
+            [[ $seen == *" $s "* ]] && continue
+            seen+="$s "; CPUS+=("$s")
+        done
+        ((${#CPUS[@]})) || CPUS=("$base")
+    fi
+
+    # ---- package-level CPU readings
+    if [[ -n $D_CPU ]]; then
+        pick_grp 1 'CPU Package;;CPU \(Tctl/Tdie\);;Tctl;;Tdie;;Package Temperature;;CPU Temperature;;ЦП \(Tctl|Кристалл ЦП' \
+            || pick_grp 1 '.' >/dev/null
+        i_temp=$REPLY
+        pick_grp 7 'Total CPU Usage;;CPU Total Usage;;Total CPU Utilization;;CPU Usage;;Общая загрузка ЦП;;^Использование ядра' && i_use=$REPLY
+        pick_grp 5 'CPU Package Power;;Package Power;;^CPU Power;;Полная потребляемая мощность;;^ЦП PPT$' && i_pwr=$REPLY
+        # the CPU-fan reading often lives in the motherboard sensor ("ЦП1"
+        # on Russian boards, "CPU Fan"/"Fan #1" elsewhere), not in the CPU
+        # group itself — so fall back to a global search for it
+        pick_grp 3 'CPU Fan;;^Fan;;^ЦП1$' || pick_names 3 'CPU Fan;;^Fan [0-9]?$;;^Fan$;;^ЦП1$' || true
+        i_fan=$REPLY
+        # A bus clock is not what anyone means by "clock": take the core clock
+        # aggregate first, then core 0, and only then fall back to the bus.
+        pick_grp 6 '^Частоты ядер$;;^Core Clocks$;;^CPU Clock$;;^CPU Core Clock$' && i_clk=$REPLY
+        ((i_clk < 0)) && { pick_grp 6 '^Частота ГП$' >/dev/null 2>&1; i_clk=-1; }
+        ((i_clk < 0)) && { pick_grp 6 'Bus Clock;;Частота шины' && i_clk=$REPLY; }
+        # The VID average is a request, not a rail; prefer the measured core
+        # voltage when the sensor publishes one.
+        pick_grp 2 'Напряжение ядра ЦП;;CPU Core Voltage;;^Core Voltage$;;^Vcore$;;ЦП Core VID' && i_vcore=$REPLY
+        ((i_vcore < 0)) && { pick_grp 2 '^Core VIDs$;;^CPU Core Voltage$' && i_vcore=$REPLY; }
+    fi
+    ((i_temp < 0)) && { pick_names 1 'CPU Package;;CPU Temperature;;Tctl;;ЦП \(Tctl|Кристалл ЦП' && i_temp=$REPLY; }
+    ((i_use  < 0)) && { pick_names 7 'Total CPU Usage;;CPU Total Usage;;Общая загрузка ЦП' && i_use=$REPLY; }
+    ((i_vcore < 0)) && { pick_names 2 'CPU Core Voltage;;^Vcore$;;Напряжение ядра ЦП' && i_vcore=$REPLY; }
+
+    # ---- per-core readings, keyed by core number so temp/usage/clock line up
+    # even when the three live in different sub-sensors.
+    local -A c_t=() c_k=() u_t=() u_n=()
+    local cn v tenth
+    for i in "${!S_SEN[@]}"; do
+        in_group "${S_SEN[i]}" || continue
+        [[ ${S_NAM[i]} =~ $CORE_RE ]] || continue
+        cn=$((10#${BASH_REMATCH[1]}))
+        case ${S_TYP[i]} in
+            1) [[ -z ${c_t[$cn]:-} ]] && c_t[$cn]=$i ;;
+            6) if [[ ${S_NAM[i]} =~ (Частота|Clock|MHz) && ! ${S_NAM[i]} =~ (Эффективн|Effective) ]]; then
+                   [[ -z ${c_k[$cn]:-} ]] && c_k[$cn]=$i
+               fi ;;
+            7) v=${S_VAL[i]//,/}
+               if [[ $v =~ ^(-?[0-9]+)(\.([0-9]))?$ ]]; then
+                   tenth=$(( 10#${BASH_REMATCH[1]} * 10 ))
+                   [[ -n ${BASH_REMATCH[3]:-} ]] && tenth=$(( tenth + 10#${BASH_REMATCH[3]} ))
+                   u_t[$cn]=$(( ${u_t[$cn]:-0} + tenth ))
+                   u_n[$cn]=$(( ${u_n[$cn]:-0} + 1 ))
+               fi ;;
+        esac
+    done
+
+    # every core that has any reading, in numeric order
+    local -A all=() 
+    for cn in "${!c_t[@]}"; do all[$cn]=1; done
+    for cn in "${!u_t[@]}"; do all[$cn]=1; done
+    for cn in "${!c_k[@]}"; do all[$cn]=1; done
+    local -a cnums=()
+    ((${#all[@]})) && while read -r cn; do
+        [[ -n $cn ]] && cnums+=("$cn")
+    done < <(printf '%s\n' "${!all[@]}" | sort -n)
+
+    local avg
+    for cn in "${cnums[@]}"; do
+        CTK+=("$cn")
+        if [[ -n ${c_t[$cn]:-} ]]; then
+            CT+=("${S_VAL[c_t[$cn]]}"); USED+=("${c_t[$cn]}")
+        else CT+=(""); fi
+        if [[ -n ${u_t[$cn]:-} && ${u_n[$cn]:-0} -gt 0 ]]; then
+            avg=$(( u_t[$cn] / u_n[$cn] ))
+            CU+=("$(( avg / 10 )).$(( avg % 10 ))")
+            [[ -n ${c_t[$cn]:-} ]] || true
+            # every thread reading of this core counts as consumed
+            for i in "${!S_NAM[@]}"; do
+                [[ ${S_TYP[i]} == 7 ]] || continue
+                in_group "${S_SEN[i]}" || continue
+                [[ ${S_NAM[i]} =~ $CORE_RE ]] || continue
+                (( 10#${BASH_REMATCH[1]} == cn )) && USED+=("$i")
+            done
+        else CU+=(""); fi
+        if [[ -n ${c_k[$cn]:-} ]]; then
+            CK+=("${S_VAL[c_k[$cn]]}"); USED+=("${c_k[$cn]}")
+        else CK+=(""); fi
+    done
+    # HWiNFO usually has no package-wide clock; core 0 is a fine stand-in
+    if ((i_clk < 0)) && ((${#CK[@]} > 0)) && [[ -n ${CK[0]} ]]; then i_clk=-2; fi
+
+    # ---- GPU: prefer a sensor that actually reports a temperature or a load
+    local gsen=""
+    gsen=$(find_names '1|7' 'Температура ГП|GPU Temperature|GPU Core Load|Использование ГП|GPU Load' && printf '%s' "${S_SEN[REPLY]}")
+    if [[ -z $gsen ]]; then
+        for i in "${!S_SEN[@]}"; do
+            if [[ ${S_SEN[i]} =~ ^(GPU|dGPU|.*NVIDIA.*|.*Radeon.*) ]]; then gsen=${S_SEN[i]}; break; fi
+        done
+    fi
+    if [[ -n $gsen ]]; then
+        pick_names 1 '^Температура ГП$;;^GPU Temperature$;;^GPU Temp' "$gsen" && g_temp=$REPLY
+        pick_names 1 'Температура горячей точки;;Hot ?Spot;;Hotspot' "$gsen" && g_hot=$REPLY
+        pick_names 7 '^Использование ГП$;;GPU Core Load;;GPU Utilization;;^GPU Load$' "$gsen" && g_load=$REPLY
+        pick_names 5 'Общая мощность графики;;GPU Power;;Board Power' "$gsen" && g_pwr=$REPLY
+        pick_names 3 '^GPU Вентилятор$;;GPU Fan;;^Fan$' "$gsen" && g_fan=$REPLY
+        pick_names 6 '^Частота ГП$;;GPU Core Clock;;^GPU Clock$' "$gsen" && g_clk=$REPLY
+        # physical VRAM only: "GPU Memory Usage" also counts shared/system
+        # pages (24GB "used" on a 12GB card), D3D Dedicated is the on-card part
+        pick_names 8 '^Выделенная память D3D ГП$;;GPU D3D Memory Dedicated;;GPU Memory Used' "$gsen" && g_mu=$REPLY
+        pick_names 8 'GPU Memory Total;;Общий объем памяти ГП' "$gsen" && g_mt=$REPLY
+    fi
+
+    # ---- memory: the system sensor has no single "total" reading, so total
+    # is reconstructed as used + available, which HWiNFO keeps consistent.
+    pick_names 8 'Используемая физическая память;;^Physical Memory Used$;;^Memory Used$;;^Used Physical Memory$' && m_used=$REPLY
+    pick_names 8 'Доступная физическая память;;^Physical Memory Available$' && m_avail=$REPLY
+    pick_names 8 '^Physical Memory Total$;;^Memory Total$' && m_total=$REPLY
+    pick_names 8 'Загрузка физической памяти;;^Physical Memory Load$;;^Memory Load$;;^Total Memory Usage$' && m_load=$REPLY
+    # HWiNFO publishes no total on this sensor, only used and available, so the
+    # total is the SUM OF THE VALUES. Summing the table indices instead once
+    # produced "8407/1024 MB" -- plausible-looking and completely wrong.
+    if ((m_total < 0)) && ((m_used >= 0 && m_avail >= 0)); then
+        local _u _a
+        val_num "$m_used"; _u=$REPLY
+        val_num "$m_avail"; _a=$REPLY
+        if [[ -n $_u && -n $_a ]]; then m_total=-3; M_TOTAL_V=$(( _u + _a )); fi
+    fi
+
+    # swap / page file
+    pick_names 8 '^Page File Total$;;Файл подкачки.*(Всего|Общий)' && s_total=$REPLY
+    pick_names 8 '^Page File Used$;;Файл подкачки.*Использ' && s_used=$REPLY
+    pick_names 7 'Использование файла подкачки;;^Page File Usage$' && s_load=$REPLY
+
+    # virtual memory (commit)
+    pick_names 8 'Выделенная виртуальная память;;^Virtual Memory Committed$;;^Commit Charge$' && v_used=$REPLY
+    pick_names 8 'Доступная виртуальная память;;^Virtual Memory Available$' && v_avail=$REPLY
+    pick_names 8 '^Virtual Memory Total$;;^Commit Limit$' && v_total=$REPLY
+    if ((v_total < 0)) && ((v_used >= 0 && v_avail >= 0)); then
+        local _vu _va
+        val_num "$v_used";  _vu=$REPLY
+        val_num "$v_avail"; _va=$REPLY
+        if [[ -n $_vu && -n $_va ]]; then v_total=-3; V_TOTAL_V=$(( _vu + _va )); fi
+    fi
+    pick_names 7 'Загрузка виртуальной памяти;;^Virtual Memory Load$' && v_load=$REPLY
+
+    # network
+    pick_names 8 'Текущая скорость скачивания;;Download Rate;;^DL Rate' && n_dn=$REPLY
+    pick_names 8 'Текущая скорость отправки;;Upload Rate;;^UL Rate' && n_up=$REPLY
+}
+
+tonum() { fmtval "$1" 0 >/dev/null; toint "${REPLY:-0}"; }
+
+val_num() { # val_num IDX -> REPLY integer value, empty when not numeric
+    # Values arrive as display strings ("8,114" / "46.430"), so the comma has
+    # to go before they can be added. Empty means "not monitored", which must
+    # stay distinguishable from a genuine 0.
+    val_of "$1"
+    local v=${REPLY//,/}
+    if [[ $v =~ ^(-?[0-9]+)(\.[0-9]*)?$ ]]; then REPLY=$((10#${BASH_REMATCH[1]}))
+    else REPLY=""; fi
+}
+
+is_used() { local u; for u in "${USED[@]}"; do [[ $u == "$1" ]] && return 0; done; return 1; }
+
+val_of() { # val_of IDX -> REPLY raw value or ""
+    local i=$1
+    if ((i >= 0 && i < ${#S_VAL[@]})); then REPLY=${S_VAL[i]}; else REPLY=""; fi
+}
+unit_of() {
+    local i=$1
+    if ((i >= 0 && i < ${#S_UNI[@]})); then REPLY=${S_UNI[i]}; else REPLY=""; fi
+}
+
+# ---------------------------------------------------------------- short names
+# Display names are always short English tokens. Server reading names may be
+# Russian or long English; short_name() maps each to a compact label. Exact
+# hits come from SHORTMAP; per-core forms fall through to regex rules; the
+# leftover is stripped of Russian words. Match patterns elsewhere in the file
+# MUST keep the original Russian/English server names -- only display text
+# passes through here.
+declare -A SHORTMAP=(
+    # --- CPU package
+    ["ЦП (Tctl/Tdie)"]="Tctl"     ["ЦП CCD1 (Tdie)"]="Tdie"
+    ["Кристалл ЦП (среднее)"]="CPU avg" ["ЦП IOD Hotspot"]="IOD"
+    ["ЦП (PECI)"]="PECI"          ["L3 Кэш (CCD1)"]="L3"
+    ["Общая загрузка ЦП"]="load"  ["Использование ядра"]="load"
+    ["Макс. загрузка ЦП/потоков"]="max load"
+    ["Полная потребляемая мощность ЦП"]="pwr" ["ЦП PPT"]="PPT"
+    ["Напряжение ядра ЦП (SVI2 TFN)"]="vcore" ["ЦП Core VID (Effective)"]="VID"
+    ["Ток ядра ЦП (SVI2 TFN)"]="Icore" ["Частоты ядер"]="clk"
+    ["Средняя эффективная частота"]="eff clk" ["Эффективные частоты ядер"]="eff clk"
+    ["Частота шины"]="bus"        ["Множители частоты ядра"]="ratio"
+    ["Потребляемая мощность ядер"]="core pwr"
+    ["Потребляемая мощность ЦП на кристалле (SVI2 TFN)"]="die pwr"
+    ["Core+SoC Потребляемая мощность (SVI2 TFN)"]="c+soc pwr"
+    ["ЦП EDC"]="EDC" ["ЦП TDC"]="TDC" ["Thermal Limit"]="t limit"
+    ["ЦП Потребляемая мощность ядра (SVI2 TFN)"]="core pwr"
+    ["Ток SoC (SVI2 TFN)"]="SoC I"
+    ["Ограничение частоты - глобально"]="clk limit"
+    ["Core VIDs"]="VID" ["Core Clocks"]="clk" ["Core Effective Clocks"]="eff clk"
+    ["Core Powers"]="core pwr" ["Core Ratios"]="ratio" ["Core Temperatures"]="temps"
+    ["Core Usage"]="load" ["L3 Clocks"]="L3 clk" ["L3 Temperatures"]="L3 temps"
+    ["L3 Частота"]="L3 clk" ["Температуры L3"]="L3 temps"
+    ["Температуры ядер"]="temps"
+    ["Среднее количество активных ядер"]="act cores"
+    ["Тепловой троттлинг (HTC)"]="HTC"
+    ["Тепловой троттлинг (PROCHOT ЦП)"]="PROCHOT"
+    ["Тепловой троттлинг (PROCHOT EXT)"]="PROCHOT ext"
+    ["SoC Напряжение (SVI2 TFN)"]="SoC V" ["Ток SoC (SVI2 TFN)"]="SoC I"
+    ["Пропускная способность чтения DRAM"]="DRAM r"
+    ["Пропускная способность записи DRAM"]="DRAM w"
+    ["Infinity Fabric Частота (FCLK)"]="FCLK"
+    ["Частота контроллера памяти (UCLK)"]="UCLK"
+    # --- GPU
+    ["Температура ГП"]="temp"     ["GPU Temperature"]="temp"
+    ["Температура горячей точки ГП"]="hot"
+    ["Использование ГП"]="load"   ["GPU Core Load"]="load"
+    ["Общая мощность графики (TGP)"]="pwr" ["GPU Power"]="pwr"
+    ["GPU Вентилятор"]="fan"      ["GPU Fan"]="fan"
+    ["GPU Вентилятор PWM"]="fan pwm"
+    ["Частота ГП"]="clk"          ["GPU Core Clock"]="clk"
+    ["Частота ГП (эффективная)"]="eff clk"
+    ["Использование памяти ГП"]="vram" ["GPU Memory Used"]="vram"
+    ["Температура памяти ГПs"]="vram temp" ["GPU Memory Temperatures"]="vram temps"
+    ["Память ГП A0/A1 Температура"]="vram A" ["Память ГП B0/B1 Температура"]="vram B"
+    ["Память ГП C0/C1 Температура"]="vram C" ["Память ГП D0/D1 Температура"]="vram D"
+    ["Память ГП E0/E1 Температура"]="vram E" ["Память ГП F0/F1 Температура"]="vram F"
+    ["Напряжение ядра ГП (VDDCR_GFX)"]="gfx V" ["GPU Core Ток (VDDCR_GFX)"]="gfx I"
+    ["GPU Потребляемая мощность ядра (VDDCR_GFX)"]="gfx pwr"
+    ["GPU ASIC Потребляемая мощность"]="asic pwr" ["GPU PPT"]="PPT"
+    ["GPU SoC Потребляемая мощность (VDDCR_SOC)"]="soc pwr"
+    ["GPU SoC Напряжение (VDDCR_SOC)"]="soc V" ["GPU SoC Ток (VDDCR_SOC)"]="soc I"
+    ["Мощность памяти ГП (VDDCI_MEM)"]="mem pwr" ["Мощность памяти ГП (VDDIO)"]="mem pwr"
+    ["Напряжение памяти ГП (VDDCI_MEM)"]="mem V" ["Напряжение памяти ГП (VDDIO)"]="mem V"
+    ["Ток памяти ГП (VDDCI_MEM)"]="mem I" ["Ток памяти ГП (VDDIO)"]="mem I"
+    ["Частота памяти ГП"]="mem clk" ["GPU VR SoC Температура"]="soc temp"
+    ["GPU VR VDDC Температура"]="vddc temp" ["Температура соединений в ГП"]="junction"
+    ["Температурные пределы ГП"]="t limits" ["GPU Thermal Limits"]="t limits"
+    ["Предел температуры края ГП"]="t edge" ["Предел температуры горячей точки ГП"]="t hot"
+    ["Предел температуры памяти ГП"]="t mem"
+    ["Предел температуры VR GFX ГП"]="t vr gfx" ["Предел температуры VR SOC ГП"]="t vr soc"
+    ["Ограничение PPT ГП"]="PPT limit" ["Предел SOC TDC ГП"]="soc TDC"
+    ["Предел TDC ядра ГП"]="core TDC"
+    ["Использование D3D ГП"]="D3D" ["Использование D3D ГП (1)"]="D3D 1"
+    ["Использование контроллера памяти ГП"]="mem ctl"
+    ["Выделенная память D3D ГП"]="D3D alloc" ["Динамическая память D3D ГП"]="D3D dyn"
+    ["Скорость соединения PCIe"]="PCIe"
+    ["GPU Computing (Compute 0) Использование"]="compute 0"
+    ["GPU Computing (Compute 1) Использование"]="compute 1"
+    ["GPU Computing (Compute 3) Использование"]="compute 3"
+    ["GPU Computing (High Priority Compute) Использование"]="compute hp"
+    ["GPU Video Decode 0 Использование"]="vdec 0" ["GPU Video Decode 1 Использование"]="vdec 1"
+    # --- memory / system
+    ["Используемая физическая память"]="ram used" ["Доступная физическая память"]="ram avail"
+    ["Загрузка физической памяти"]="ram load" ["Page File Total"]="page total"
+    ["Page File Used"]="page used" ["Использование файла подкачки"]="page load"
+    ["Выделенная виртуальная память"]="virt used" ["Доступная виртуальная память"]="virt avail"
+    ["Загрузка виртуальной памяти"]="virt load"
+    # --- network
+    ["Текущая скорость скачивания"]="down" ["Download Rate"]="down"
+    ["Текущая скорость отправки"]="up" ["Upload Rate"]="up"
+    ["Всего скачано"]="tot down" ["Всего отправлено"]="tot up"
+    # --- drives
+    ["Температура диска"]="temp" ["Температура диска 2"]="temp2" ["Температура диска 3"]="temp3"
+    ["Скорость чтения"]="read" ["Скорость записи"]="write"
+    ["Активность чтения"]="act r" ["Активность записи"]="act w"
+    ["Общая активность"]="act"
+    ["Прочитано итого"]="tot read" ["Записано итого"]="tot write"
+    ["Оставшийся срок службы диска"]="life" ["Предупреждение о диске"]="warn"
+    ["Сбой диска"]="fail" ["Доступный резерв диска"]="spare"
+    ["Всего хост-чтений"]="host r" ["Всего хост-записей"]="host w"
+    # --- board / misc
+    ["Системная плата"]="board" ["Корпус1"]="case1" ["Корпус2"]="case2"
+    ["ЦП1"]="cpu fan" ["CPU Fan"]="cpu fan" ["Fan 1"]="fan 1"
+    ["Несанкционированное вскрытие корпуса"]="intrusion"
+    ["Вспомогательный"]="aux" ["Частота памяти"]="mem clk"
+    ["Множитель частоты памяти"]="mem ratio"
+    ["Всего ошибок"]="WHEA"
+    # --- frames (PresentMon/RTSS)
+    ["Частота кадров"]="fps" ["Время кадра"]="frame"
+    ["Частота кадров 0.1% низкая"]="fps 0.1%" ["Частота кадров 1% низкая"]="fps 1%"
+    ["Частота кадров выведена (0.1% low)"]="fps disp 0.1%"
+    ["Частота кадров выведена (0.1%)"]="fps disp 0.1"
+    ["Частота кадров выведена (1% low)"]="fps disp 1%"
+    ["Частота кадров выведена (1%)"]="fps disp 1"
+    ["Частота кадров выведена (99%)"]="fps disp 99%"
+    ["Частота кадров выведена (avg)"]="fps disp avg"
+    ["Частота кадров представлена (0.1% low)"]="fps pres 0.1%"
+    ["Частота кадров представлена (0.1%)"]="fps pres 0.1"
+    ["Частота кадров представлена (1% low)"]="fps pres 1%"
+    ["Частота кадров представлена (1%)"]="fps pres 1"
+    ["Частота кадров представлена (99%)"]="fps pres 99%"
+    ["Частота кадров представлена (avg)"]="fps pres avg"
+    ["Frame Time Displayed (0.1% high)"]="ft disp 0.1%"
+    ["Frame Time Displayed (1% high)"]="ft disp 1%"
+    ["Frame Time Presented (0.1%)"]="ft pres 0.1%"
+    ["Frame Time Presented (1%)"]="ft pres 1%"
+    ["Frame Time Presented (99%)"]="ft pres 99%"
+    ["Frame Time Presented (avg)"]="ft pres avg"
+    ["Animation Error (avg)"]="anim err"
+    ["GPU Busy (avg)"]="gpu busy" ["GPU Wait (avg)"]="gpu wait"
+    ["ЦП Busy (avg)"]="cpu busy" ["ЦП Wait (avg)"]="cpu wait"
+    # --- voltages (board)
+    ["+12В"]="+12V" ["+5В"]="+5V" ["+3.3В (3VCC)"]="3VCC" ["+3.3В (AVCC)"]="AVCC"
+    # --- c-state residency (whole-CPU forms; per-core are regex below)
+    ["Core C0 Резидентность"]="C0 res" ["Core C1 Резидентность"]="C1 res"
+    ["Core C6 Резидентность"]="C6 res" ["Package C6 Резидентность"]="pkg C6"
+    ["Core C0 Residency"]="C0 res" ["Core C1 Residency"]="C1 res"
+    ["Core C6 Residency"]="C6 res"
+)
+short_name() { # short_name NAME -> REPLY = short English display label
+    local n=$1
+    [[ -n ${SHORTMAP[$n]+x} ]] && { REPLY=${SHORTMAP[$n]}; return; }
+    # per-core forms: "Core N T0 Эффективная частота", "Core N Частота
+    # (perf #a/b)", "Core N Множитель", "Core N Потребляемая мощность", ...
+    local re
+    re='^Core ([0-9]+) (T[01]) Эффективная частота$'
+    [[ $n =~ $re ]] && { REPLY="C${BASH_REMATCH[1]}${BASH_REMATCH[2]} eff"; return; }
+    re='^Core ([0-9]+) (T[01]) Использование$'
+    [[ $n =~ $re ]] && { REPLY="C${BASH_REMATCH[1]}${BASH_REMATCH[2]}"; return; }
+    re='^Core ([0-9]+) Частота'
+    [[ $n =~ $re ]] && { REPLY="C${BASH_REMATCH[1]} clk"; return; }
+    re='^Core ([0-9]+) Множитель$'
+    [[ $n =~ $re ]] && { REPLY="C${BASH_REMATCH[1]} ratio"; return; }
+    re='^Core ([0-9]+) Потребляемая мощность$'
+    [[ $n =~ $re ]] && { REPLY="C${BASH_REMATCH[1]} pwr"; return; }
+    re='^Core ([0-9]+) VID$'
+    [[ $n =~ $re ]] && { REPLY="C${BASH_REMATCH[1]} VID"; return; }
+    re='^Core ([0-9]+) C([0-6]) Резидентность$'
+    [[ $n =~ $re ]] && { REPLY="C${BASH_REMATCH[1]} C${BASH_REMATCH[2]}"; return; }
+    re='^Core([0-9]+) \(CCD([0-9]+)\)$'
+    [[ $n =~ $re ]] && { REPLY="C${BASH_REMATCH[1]}"; return; }
+    # sensor group names: "ЦП [#0]: AMD Ryzen 5 5600", "dGPU [#0]: ...",
+    # "Drive: X (serial) [C:]", "S.M.A.R.T.: ..." -- keep the tail
+    re='^(ЦП|GPU|dGPU|Drive|S\.M\.A\.R\.T\.|Сеть)\[#0\]: +(.*)$'
+    [[ $n =~ $re ]] && { n=${BASH_REMATCH[2]}; }
+    re='^(.*): +Enhanced$'
+    [[ $n =~ $re ]] && { REPLY="${BASH_REMATCH[1]}"; return; }
+    # last resort: transliterate common Russian words, trim
+    n=${n%% (*}
+    n=${n//ГП/GPU}; n=${n//ЦП/CPU}; n=${n//Температура/temp}; n=${n//Напряжение/V}
+    n=${n//Потребляемая мощность/pwr}; n=${n//Использование/load}; n=${n//Частота/clk}
+    n=${n//Резидентность/res}
+    trunc "$n" 14
+    REPLY=${REPLY%% }
+}
+disp_name() { # disp_name SENSOR-NAME -> REPLY = short display name
+    # "ЦП [#0]: AMD Ryzen 5 5600: Enhanced" -> "AMD Ryzen 5 5600"
+    # "dGPU [#0]: AMD Radeon RX 6700 XT: MSI ..." -> "RX 6700 XT"
+    # "Drive: ADATA SE760 (429084B4600E) [E:]" -> "ADATA SE760 [E:]"
+    local n=$1 re
+    re='^(ЦП|GPU|dGPU) \[#0\]: +'
+    [[ $n =~ $re ]] && n=${n:${#BASH_REMATCH[0]}}
+    re='^(Drive|S\.M\.A\.R\.T\.): +'
+    [[ $n =~ $re ]] && n=${n:${#BASH_REMATCH[0]}}
+    re='^(.*): +(Enhanced|C-State.*|Power|Clocks?|Voltages?)$'
+    [[ $n =~ $re ]] && n=${BASH_REMATCH[1]}
+    # drop the serial/paren tail of drive names, keep the partition letter
+    re='^(.*) \([A-Z0-9]+\)( \[.:\])?$'
+    [[ $n =~ $re ]] && n="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+    # GPU: "AMD Radeon RX 6700 XT: MSI RX 6700 XT MECH 2X OC 12G" -> "RX 6700 XT"
+    re='^(AMD )?Radeon (RX [0-9]+ ?[A-Za-z]*)'
+    [[ $n =~ $re ]] && { REPLY="${BASH_REMATCH[2]% }"; return; }
+    re='^(NVIDIA )?(GeForce )?(RTX|GTX) ([0-9]+.*)'
+    [[ $n =~ $re ]] && { REPLY="${BASH_REMATCH[3]} ${BASH_REMATCH[4]}"; return; }
+    # NIC: "Сеть: Intel I211AT Copper (...)" -> "Intel I211AT"
+    re='^(Сеть|Network): +'
+    [[ $n =~ $re ]] && n=${n:${#BASH_REMATCH[0]}}
+    re='^(Intel|Realtek|Broadcom|Qualcomm|MediaTek|Killer) ([A-Z0-9]+)'
+    [[ $n =~ $re ]] && { REPLY="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"; return; }
+    # board: "ASRock B450 Gaming-ITX/ac (Nuvoton NCT6792D)" -> "ASRock B450"
+    re='^(ASRock|ASUS|Gigabyte|MSI|Biostar) ([A-Z0-9]+)'
+    [[ $n =~ $re ]] && { REPLY="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"; return; }
+    # "Тайминги памяти" -> "RAM timings"; process/thread panels keep their tag
+    [[ $n == "Тайминги памяти" ]] && { REPLY="RAM timings"; return; }
+    re='^(PresentMon|RTSS)'
+    [[ $n =~ $re ]] && { REPLY="${BASH_REMATCH[1]}"; return; }
+    trunc "$n" 24
+    REPLY=${REPLY%% }
+}
+# ----------------------------------------------------------------- history
+H_MAX=300
+declare -a H_CT=() H_CP=() H_GT=() H_ML=() H_DN=() H_UP=()
+
+hpush() { # hpush ARRAY VALUE
+    local -n h=$1
+    h+=("$2")
+    while ((${#h[@]} > H_MAX)); do h=("${h[@]:1}"); done
+}
+
+spark() { # spark ARRAY WIDTH MAX -> REPLY (plain, right-aligned)
+    local -n h=$1
+    local w=$2 max=$3
+    [[ $max =~ ^[0-9]+$ ]] || max=1
+    ((max < 1)) && max=1
+    local chars=(▁ ▂ ▃ ▄ ▅ ▆ ▇ █)
+    local n=${#h[@]} out="" i k v first
+    if ((n == 0 || w < 1)); then REPLY=""; return; fi
+    first=0
+    ((n > w)) && first=$((n - w))
+    rep ' ' $((w - (n - first))); out=$REPLY
+    for ((i = first; i < n; i++)); do
+        v=${h[i]}
+        [[ $v =~ ^-?[0-9]+$ ]] || v=0
+        k=$(( (v * 8 + max - 1) / max ))
+        ((k < 1)) && k=1
+        ((k > 8)) && k=8
+        out+="${chars[k - 1]}"
+    done
+    REPLY=$out
+}
+
+graph() { # graph ARRAY ROWS WIDTH MAX COLOR [LABEL] [MIN] -> REPLY (\n-joined)
+    # Multi-row graph: each column is blocks stacked up from the bottom, so the
+    # vertical resolution is ROWS*8 steps. Values above MAX clip to the top.
+    # Samples fill from the left and scroll left once they no longer fit.
+    local -n h=$1
+    local rows=$2 w=$3 max=$4 col=$5 label=${6:-} min=${7:-0}
+    [[ $max =~ ^[0-9]+$ ]] || max=1
+    ((max < 1)) && max=1
+    [[ $min =~ ^-?[0-9]+$ ]] || min=0
+    local range=$(( max - min ))
+    ((range < 1)) && range=1
+    ((rows < 1 || w < 1)) && { REPLY=""; return; }
+    local n=${#h[@]} first=0 pad=w
+    ((n > w)) && first=$(( n - w ))
+    ((n < w)) && pad=$(( w - n ))
+    local span=$(( rows * 8 ))
+    local -a level=()
+    local i v l ci
+    for ((ci = 0; ci < w; ci++)); do
+        if ((ci < pad)); then level+=(-1); continue; fi
+        i=$(( first + ci - pad ))
+        if ((i < 0 || i >= n)); then level+=(-1); continue; fi
+        v=${h[i]}
+        [[ $v =~ ^-?[0-9]+$ ]] || v=0
+        l=$(( ((v - min) * span + range / 2) / range ))
+        ((l < 0)) && l=0
+        ((l > span)) && l=span
+        level+=("$l")
+    done
+    local r base e glyph text line
+    local -a lines=()
+    for ((r = rows - 1; r >= 0; r--)); do
+        base=$(( r * 8 ))
+        line=""
+        for ((ci = 0; ci < w; ci++)); do
+            l=${level[ci]}
+            e=$(( l - base ))
+            if ((e <= 0)); then line+=" "
+            elif ((e >= 8)); then line+="█"
+            else
+                case $e in
+                    1) line+="▁" ;; 2) line+="▂" ;; 3) line+="▃" ;; 4) line+="▄" ;;
+                    5) line+="▅" ;; 6) line+="▆" ;; 7) line+="▇" ;;
+                    *) line+="█" ;;
+                esac
+            fi
+        done
+        lines+=("${col}${line}${R}")
+    done
+    if [[ -n $label ]]; then
+        # btop-style label painted over the bottom row's leftmost columns
+        local last=$(( rows - 1 ))
+        local body=${lines[last]}
+        body=${body#"${col}"}
+        body=${body%"${R}"}
+        local nlab=${#label}
+        lines[last]="${col}${C_LBL}${label}${col}${body:nlab}${R}"
+    fi
+    local IFS=$'\n'
+    REPLY="${lines[*]}"
+}
+
+graph_rows() { # graph_rows ARRAY COUNT WIDTH MAX COLOR [LABEL] [MIN] -> GRAPH_LINES
+    local out
+    graph "$@"
+    out=$REPLY
+    GRAPH_LINES=()
+    local l
+    while IFS= read -r l; do GRAPH_LINES+=("$l"); done <<<"$out"
+}
+
+hmin() { # hmin ARRAY -> REPLY min value (0 when empty)
+    local -n h=$1
+    local v m=-1
+    for v in "${h[@]}"; do
+        [[ $v =~ ^-?[0-9]+$ ]] || continue
+        if ((m < 0 || v < m)); then m=$v; fi
+    done
+    ((m < 0)) && m=0
+    REPLY=$m
+}
+
+hmax() { # hmax ARRAY -> REPLY max value
+    local -n h=$1
+    local v m=0
+    for v in "${h[@]}"; do
+        [[ $v =~ ^-?[0-9]+$ ]] || continue
+        ((v > m)) && m=$v
+    done
+    ((m < 1)) && m=1
+    REPLY=$m
+}
+
+# ------------------------------------------------------------------ panels
+# Every build_$NAME W H fills a global array with exactly H lines of width W.
+# Panels compose from: p_start / p_row / p_rule / p_graph / p_blank / p_end,
+# and p_finish pads them out. Nothing here may leave REPLY from one helper
+# visible to the next: capture results into locals immediately.
+
+fmt1() { # fmt1 RAW -> REPLY one decimal, or "--"
+    fmtval "${1:-}" 1
+    [[ -n $REPLY ]] || REPLY="--"
+}
+fmt0() { # fmt0 RAW -> REPLY no decimals, or "--"
+    fmtval "${1:-}" 0
+    [[ -n $REPLY ]] || REPLY="--"
+}
+reading() { # reading INDEX DIGITS -> VALUE (formatted or "--")
+    val_of "$1"
+    fmtval "$REPLY" "$2"
+    [[ -n $REPLY ]] || REPLY="--"
+    VALUE=$REPLY
+}
+
+p_graph_temp() { # p_graph_temp ARRAY ROWS [LABEL] -> graph autoscaled to the data
+    # A fixed C axis flattens a real trace into one solid row: 4 rows over a
+    # 70-degree window is ~2 C per row. Scale to the observed min/max instead,
+    # with a little headroom so the newest peak does not touch the ceiling.
+    local arr=$1 rows=$2 label=${3:-} peak lo pad
+    hmax "$arr"; peak=$REPLY
+    hmin "$arr"; lo=$REPLY
+    pad=$(( (peak - lo) / 8 ))
+    ((pad < 2)) && pad=2
+    peak=$(( peak + pad ))
+    lo=$(( lo - pad ))
+    ((lo < 0)) && lo=0
+    ((peak - lo < 4)) && peak=$(( lo + 4 ))
+    p_graph "$arr" "$rows" "$peak" "$label" "$lo"
+}
+
+p_graph() { # p_graph ARRAY ROWS MAX [LABEL] [MIN] -> append ROWS graph lines
+    local arr=$1 rows=$2 max=${3:-0} label=${4:-} min=${5:-0} i
+    ((rows < 1)) && return 0
+    if [[ $max == 0 ]]; then hmax "$arr"; max=$REPLY; fi
+    ((max <= min)) && max=$(( min + 1 ))
+    graph_rows "$arr" "$rows" $(( P_W - 2 )) "$max" "$C_DIM" "$label" "$min"
+    for i in "${GRAPH_LINES[@]}"; do
+        P_LINES+=("${C_BRD}│${R}${i}${C_BRD}│${R}")
+    done
+}
+
+build_header() { # W -> HEADER_LINES
+    local w=$1 iw=$(( w - 2 ))
+    local now dot state col left right lw rw gap line t
+    now=$(date +%H:%M:%S)
+    local DROP=0
+    ((LINE_LOST >= 3)) && DROP=1
+    if ((DROP)); then dot="●"; state="NO DATA"; col=$C_BAD
+    elif ((STALE)); then dot="●"; state="OFFLINE"; col=$C_BAD
+    elif ((PAUSED)); then dot="●"; state="PAUSED"; col=$C_WARN
+    else dot="●"; state="LIVE"; col=$C_OK; fi
+    left=" ${C_ACC}${BASE_URL}${R}  ${col}${dot} ${state}${R}"
+    left+="  ${C_LBL}read${R} ${READ_RTT}ms  ${C_LBL}poll${R} ${INTERVAL}s"
+    [[ -n $SRV_VER ]] && left+="  ${C_LBL}api v${R}${SRV_VER}"
+    if [[ -n $LAST_ERR ]]; then trunc "$LAST_ERR" 40; left+="  ${C_BAD}${REPLY}${R}"; fi
+    right="${C_LBL}updates ${R}${POLLS}  ${BOLD}${now}${R} "
+    vislen "$left";  lw=$VLEN
+    vislen "$right"; rw=$VLEN
+    gap=$(( iw - lw - rw ))
+    ((gap < 0)) && gap=0
+    rep ' ' "$gap"
+    if ((lw + rw <= iw)); then
+        line="${left}${REPLY}${right}"
+    else
+        # Not enough room for both halves. Drop the right half to just the
+        # clock (it is the one part worth keeping) and give the rest to the
+        # left, so a narrow header degrades instead of truncating the right
+        # text into the left one ("aupdates 40" read as one word).
+        right="  ${BOLD}${now}${R} "
+        vislen "$right"; rw=$VLEN
+        local room=$(( iw - rw ))
+        if ((room < 12)); then
+            # narrower still: clock only, left side dropped entirely
+            line=$right
+        else
+            fit "$left" "$room"
+            line="${REPLY}${right}"
+        fi
+    fi
+
+    t=" $APP $VER "
+    rep '─' $(( w - 3 - ${#t} ))
+    HEADER_LINES=("${C_BRD}┌─${C_TTL}${t}${C_BRD}${REPLY}┐${R}")
+    fit "$line" "$iw"
+    HEADER_LINES+=("${C_BRD}│${R}${REPLY}${C_BRD}│${R}")
+    rep '─' "$iw"
+    HEADER_LINES+=("${C_BRD}└${REPLY}┘${R}")
+}
+
+build_cpu() { # W H -> CPUL
+    local w=$1 h=$2
+    local iw=$(( w - 2 ))
+    P_W=$w; P_LINES=()
+    p_start "CPU"
+
+    local bar_s tv uv pv fv cv tp=0 up=0 line mx
+    if [[ -n $D_CPU ]]; then
+        disp_name "$D_CPU"; trunc "$REPLY" $((iw - 1)); p_row " ${C_LBL}${REPLY}${R}"
+    fi
+
+    local bw=$(( iw - 32 ))
+    ((bw > 22)) && bw=22
+    ((bw < 6)) && bw=6
+
+    # package temperature
+    reading "$i_temp" 1; tv=$VALUE
+    local tcol=$C_DIM
+    if [[ $tv != "--" ]]; then
+        tp=${tv%.*}; temp_color "$tp"; tcol=$REPLY
+    fi
+    temp_bar "$tp" "$bw"; bar_s=$REPLY
+    hmax H_CT; mx=$REPLY
+    local tshow=$tv
+    [[ $tv != "--" ]] && tshow+="°C"
+    p_row " ${C_LBL}temp ${R}${tcol}${BOLD}$(printf '%7s' "$tshow")${R} ${bar_s} ${C_DIM}peak $mx°${R}"
+
+    # total usage
+    reading "$i_use" 1; uv=$VALUE
+    local ucol=$C_DIM
+    if [[ $uv != "--" ]]; then
+        up=${uv%.*}; pct_color "$up"; ucol=$REPLY
+    fi
+    bar "$up" "$bw"; bar_s=$REPLY
+    local ushow=$uv
+    [[ $uv != "--" ]] && ushow+="%"
+    p_row " ${C_LBL}use  ${R}${ucol}${BOLD}$(printf '%7s' "$ushow")${R} ${bar_s}"
+
+    # power / fan / clock / core voltage
+    reading "$i_pwr" 1; pv=$VALUE; [[ $pv != "--" ]] && pv+=" W"
+    reading "$i_fan" 0; fv=$VALUE; [[ $fv != "--" ]] && fv+=" RPM"
+    if ((i_clk == -2)); then
+        if [[ -n ${CK[0]:-} ]]; then clk_fmt "${CK[0]}"; cv=$REPLY
+        else cv="--"; fi
+    else
+        reading "$i_clk" 0
+        if [[ $VALUE == "--" ]]; then cv="--"
+        else clk_fmt "$VALUE"; cv=$REPLY; fi
+    fi
+    reading "$i_vcore" 3; local vv=$VALUE; [[ $vv != "--" ]] && vv+=" V"
+    p_row " ${C_LBL}pwr ${R}${C_VAL}${pv}${R}  ${C_LBL}fan ${R}${C_VAL}${fv}${R}  ${C_LBL}clk ${R}${C_VAL}${cv}${R}"
+    p_row " ${C_LBL}vcore ${R}${C_VAL}${vv}${R}"
+
+    # Per-core grid and graphs share what is left: the grid shows as many
+    # rows as it can while still leaving the graph a couple of rows, and the
+    # graph scales up when the grid is short. On a tall panel both are full.
+    local nt=${#CT[@]} nu=${#CU[@]} nk=${#CK[@]}
+    local ncore=$nt
+    ((nu < ncore)) && ncore=$nu
+    local free=$(( h - 1 - ${#P_LINES[@]} ))
+    local grid_rows graph_h per cellw
+    if ((ncore > 0)); then
+        per=2
+        cellw=$(( (iw - 2) / 2 ))
+        ((cellw > 46)) && cellw=46
+        if ((cellw < 26)); then per=1; cellw=$(( iw - 2 )); fi
+        grid_rows=$(( (ncore + per - 1) / per ))
+        graph_h=$(( free / 3 ))
+        ((graph_h < 2)) && graph_h=2
+        local max_grid=$(( free - graph_h - 1 ))
+        ((max_grid < 1)) && max_grid=1
+        ((grid_rows > max_grid)) && grid_rows=$max_grid
+        ((grid_rows < 0)) && grid_rows=0
+        if ((grid_rows >= 1)); then
+            p_rule "cores ($ncore)"
+            local k ci ri=0 row seg tn un tc2 c2
+            while ((ri < grid_rows)); do
+                row=""
+                for ((k = 0; k < per; k++)); do
+                    ci=$(( ri * per + k ))
+                    if ((ci >= ncore)); then fit "" "$cellw"; row+=$REPLY; continue; fi
+                    tn=${CT[ci]}; un=${CU[ci]}
+                    tc2=$C_DIM
+                    [[ -n $tn ]] && { temp_color "${tn%.*}"; tc2=$REPLY; }
+                    [[ -z $tn ]] && tn="--"
+                    [[ -z $un ]] && un="--"
+                    local un_n=0
+                    [[ $un != "--" ]] && un_n=${un%.*}
+                    bar "$un_n" 5
+                    local b2=$REPLY          # REPLY is the cell's only channel:
+                    c2=""                    # every helper below overwrites it
+                    if [[ -n ${CK[ci]:-} ]]; then
+                        clk_fmt "${CK[ci]}"
+                        c2=" ${C_DIM}$(printf '%5s' "$REPLY")${R}"
+                    else
+                        c2=" ${C_DIM}    -${R}"
+                    fi
+                    seg=" ${C_DIM}$(printf '%2s' "${CTK[ci]}")${R} ${tc2}$(printf '%3s' "${tn%.*}")°${R} ${b2}${C_DIM}$(printf '%5s' "${un}%")${R}${c2}"
+                    fit "$seg" "$cellw"
+                    row+=$REPLY
+                done
+                p_row "$row"; ((ri++))
+            done
+        fi
+    fi
+
+    # Graphs take the tail. Temperatures autoscale; usage is always 0..100.
+    local left=$(( h - 1 - ${#P_LINES[@]} ))
+    if ((left >= 6)); then
+        p_graph_temp H_CT 3 " temp"
+        p_graph H_CP $(( left - 3 )) 100 " use" 0
+    elif ((left >= 2)); then
+        p_graph H_CP "$left" 100 " use" 0
+    fi
+    p_finish "$h"
+    CPUL=("${P_LINES[@]}")
+}
+
+build_mem() { # W H -> MEML
+    local w=$1 h=$2
+    local iw=$(( w - 2 ))
+    P_W=$w; P_LINES=()
+    p_start "MEMORY"
+
+    # Figures only, no gauge: the numbers say more than a bar did, and a bar
+    # cannot show 6833/19200 convincingly at 20 cells wide. Total is taken
+    # from the server when it publishes one, else used+available.
+    mem_line() { # mem_line LABEL USED TOTAL LOAD -> loads $MEMLINE
+        local lbl=$1 u=$2 t=$3 p=$4 pct
+        if [[ $p == "--" && $u != "--" && $t != "--" ]] && (( t > 0 )); then
+            pct=$(( u * 100 / t ))
+        elif [[ $p != "--" ]]; then
+            pct=${p}
+        else
+            pct=""
+        fi
+        local shown_u=$u shown_t=$t
+        [[ $u == "--" ]] && shown_u="--"
+        [[ $t == "--" ]] && shown_t="--"
+        local col=$C_DIM
+        [[ -n $pct ]] && { pct_color "${pct%.*}"; col=$REPLY; }
+        local ps="--"
+        [[ -n $pct ]] && ps=$(printf '%3s' "${pct%.*}")"%"
+        MEMLINE=" ${C_LBL}${lbl}${R} ${col}${BOLD}$(printf '%7s' "$shown_u")${R}${C_DIM}/${R}${C_VAL}$(printf '%7s' "$shown_t")${R} ${C_DIM}MB${R} ${col}${ps}${R}"
+    }
+
+    local mu mt mp
+    reading "$m_used" 0;  mu=$VALUE
+    if ((m_total == -3)); then mt=$M_TOTAL_V; else reading "$m_total" 0; mt=$VALUE; fi
+    reading "$m_load" 0;  mp=${VALUE%.*}
+    mem_line "ram " "$mu" "$mt" "$mp"
+    p_row "$MEMLINE"
+
+    if ((h > 4)); then
+        local su st sp
+        reading "$s_used" 0;  su=$VALUE
+        reading "$s_total" 0; st=$VALUE
+        reading "$s_load" 0;  sp=${VALUE%.*}
+        [[ $su == "--" ]] && su="0"
+        [[ $st == "--" ]] && st="0"
+        mem_line "swap" "$su" "$st" "$sp"
+        p_row "$MEMLINE"
+    fi
+
+    # commit charge, labelled on its own line so it is not mistaken for RAM
+    if ((h > 6)); then
+        local vu vt vp
+        reading "$v_used" 0;  vu=$VALUE
+        if ((v_total == -3)); then vt=$V_TOTAL_V; else reading "$v_total" 0; vt=$VALUE; fi
+        reading "$v_load" 0;  vp=${VALUE%.*}
+        [[ $vt == "--" ]] && vt="--"
+        mem_line "virt" "$vu" "$vt" "$vp"
+        p_row "$MEMLINE"
+    fi
+
+    local left=$(( h - 1 - ${#P_LINES[@]} ))
+    ((left >= 2)) && p_graph H_ML "$left" 100 " ram" 0
+    p_finish "$h"
+    MEML=("${P_LINES[@]}")
+}
+
+build_gpu() { # W H -> GPUL
+    local w=$1 h=$2
+    local iw=$(( w - 2 ))
+    P_W=$w; P_LINES=()
+    p_start "GPU"
+
+    if ((g_temp < 0 && g_load < 0 && g_mt < 0)); then
+        ((h > 3)) && p_row " ${C_DIM}no GPU sensor in this HWiNFO tree${R}"
+        p_finish "$h"; GPUL=("${P_LINES[@]}"); return
+    fi
+    local gsen=""
+    if ((g_temp >= 0)); then gsen=${S_SEN[g_temp]}
+    elif ((g_load >= 0)); then gsen=${S_SEN[g_load]}; fi
+    if [[ -n $gsen && $h -gt 5 ]]; then
+        disp_name "$gsen"; trunc "$REPLY" $((iw - 1)); p_row " ${C_LBL}${REPLY}${R}"
+    fi
+
+    local bw=$(( iw - 28 ))
+    ((bw > 26)) && bw=26
+    ((bw < 6)) && bw=6
+
+    local tv hv tv_n tp=0 tcol=$C_DIM bar_s line
+    reading "$g_temp" 1; tv=$VALUE
+    reading "$g_hot" 1;  hv=$VALUE
+    if [[ $tv != "--" ]]; then
+        tp=${tv%.*}; temp_color "$tp"; tcol=$REPLY
+    fi
+    temp_bar "$tp" "$bw"; bar_s=$REPLY
+    line=" ${C_LBL}temp ${R}${tcol}${BOLD}$(printf '%5s' "$tv°C")${R} ${bar_s}"
+    [[ $hv != "--" ]] && line+=" ${C_LBL}hot ${R}${C_VAL}${hv}°C${R}"
+    p_row "$line"
+
+    if ((h > 6)); then
+        local lv=0 lvs
+        reading "$g_load" 0; lvs=$VALUE
+        [[ $lvs != "--" ]] && lv=$lvs
+        bar "$lv" "$bw"; bar_s=$REPLY
+        p_row " ${C_LBL}load ${R}${bar_s} ${C_VAL}$(printf '%3s' "$lvs")%${R}"
+    fi
+
+    # vram: most trees have "used" but no "total" reading, so show used alone
+    # (MB) and only add the /total + bar pair when a total actually exists
+    if ((h > 7 && g_mu >= 0)); then
+        local mu=0 mt=0 mpv=0 mline
+        reading "$g_mu" 0; [[ $VALUE != "--" ]] && mu=$VALUE
+        mline=" ${C_LBL}vram ${R}${C_VAL}$(printf '%7s' "$mu") MB${R}"
+        if ((g_mt >= 0)); then
+            reading "$g_mt" 0; [[ $VALUE != "--" ]] && mt=$VALUE
+            ((mt > 0)) && mpv=$(( mu * 100 / mt ))
+            bar "$mpv" "$bw"; mline+=" ${bar_s} ${C_VAL}${mpv}%${R}"
+        fi
+        p_row "$mline"
+    fi
+
+    if ((h > 8)); then
+        local pv fv cv
+        reading "$g_pwr" 1; pv=$VALUE; [[ $pv != "--" ]] && pv+="W"
+        reading "$g_fan" 0; fv=$VALUE; [[ $fv != "--" ]] && fv+="RPM"
+        reading "$g_clk" 0; cv=$VALUE; [[ $cv != "--" ]] && cv+="MHz"
+        p_row " ${C_LBL}pwr ${R}${C_VAL}${pv}${R}  ${C_LBL}fan ${R}${C_VAL}${fv}${R}  ${C_LBL}clk ${R}${C_VAL}${cv}${R}"
+    fi
+
+    local left=$(( h - 1 - ${#P_LINES[@]} ))
+    ((left >= 2)) && p_graph_temp H_GT "$left" " temp"
+    p_finish "$h"
+    GPUL=("${P_LINES[@]}")
+}
+
+build_net() { # W H -> NETL
+    local w=$1 h=$2
+    local iw=$(( w - 2 ))
+    P_W=$w; P_LINES=()
+    p_start "NETWORK"
+
+    if ((n_dn < 0 && n_up < 0)); then
+        ((h > 3)) && p_row " ${C_DIM}no network sensor in this HWiNFO tree${R}"
+        p_finish "$h"; NETL=("${P_LINES[@]}"); return
+    fi
+
+    local dv du uv uu bar_s
+    reading "$n_dn" 1; dv=$VALUE
+    du=""
+    [[ $dv != "--" ]] && { unit_of "$n_dn"; du=${REPLY%;}; }
+    reading "$n_up" 1; uv=$VALUE
+    uu=""
+    [[ $uv != "--" ]] && { unit_of "$n_up"; uu=${REPLY%;}; }
+
+    p_row " ${C_OK}▼ ${C_LBL}down ${R}${C_VAL}$(printf '%10s' "$dv") ${du}${R}"
+    if ((h > 2)); then
+        p_row " ${C_ACC2}▲ ${C_LBL}up   ${R}${C_VAL}$(printf '%10s' "$uv") ${uu}${R}"
+    fi
+    local left=$(( h - 1 - ${#P_LINES[@]} ))
+    if ((left >= 2)); then
+        # both directions share one axis so the two graphs are comparable
+        local dm um
+        hmax H_DN; dm=$REPLY
+        hmax H_UP; um=$REPLY
+        ((um > dm)) && dm=$um
+        ((dm < 1)) && dm=1
+        p_graph H_DN $(( (left + 1) / 2 )) "$dm" " down" 0
+        ((left > 2)) && p_graph H_UP $(( left / 2 )) "$dm" " up" 0
+    fi
+    p_finish "$h"
+    NETL=("${P_LINES[@]}")
+}
+
+build_others() { # W H -> OTHL
+    local w=$1 h=$2
+    local iw=$(( w - 2 ))
+    P_W=$w; P_LINES=()
+    p_start "SENSORS"
+
+    local -a picks=()
+    local i
+    for i in "${!S_NAM[@]}"; do
+        is_used "$i" && continue
+        case ${S_TYP[i]} in
+            1|2|3|5|6|7) picks+=("$i") ;;
+        esac
+    done
+    if ((${#picks[@]} == 0)); then
+        ((h > 3)) && p_row " ${C_DIM}nothing else reported by the sensor tree${R}"
+        p_finish "$h"; OTHL=("${P_LINES[@]}"); return
+    fi
+
+    local rows=$(( h - 2 ))
+    ((rows < 1)) && rows=1
+    # column-major so the eye reads down each column, continuing to the right
+    local per=$(( (${#picks[@]} + rows - 1) / rows ))
+    ((per < 1)) && per=1
+    local maxper=$(( iw / 26 ))
+    ((maxper < 1)) && maxper=1
+    ((per > maxper)) && per=$maxper
+    local cellw=$(( iw / per ))
+    local shown=$(( per * rows ))
+    ((${#picks[@]} < shown)) && shown=${#picks[@]}
+
+    local r c idx ci row seg nm vl un vp nw vcol
+    for ((r = 0; r < rows; r++)); do
+        ((${#P_LINES[@]} >= h - 1)) && break
+        row=""
+        for ((c = 0; c < per; c++)); do
+            ci=$(( c * rows + r ))
+            seg=""
+            if ((ci < shown)); then
+                idx=${picks[ci]}
+                nm=${S_NAM[idx]}; vl=${S_VAL[idx]}; un=${S_UNI[idx]}
+                short_name "$nm"; nm=$REPLY
+                toint "$vl"; num_color "${S_TYP[idx]}" "$REPLY"; vcol=$REPLY
+                vp=$vl
+                [[ -n $un ]] && vp+=" $un"
+                nw=$(( cellw - ${#vp} - 3 ))
+                ((nw < 6)) && nw=6
+                trunc "$nm" "$nw"; seg=" ${REPLY} ${vcol}${vp}${R}"
+            fi
+            fit "$seg" $(( cellw - 1 ))
+            row+="${REPLY} "
+            ((c == per - 1)) && row=${row% }
+        done
+        p_row "$row"
+    done
+    if ((shown < ${#picks[@]})); then
+        p_row " ${C_DIM}… $(( ${#picks[@]} - shown )) more (widen the terminal)${R}"
+    fi
+    p_finish "$h"
+    OTHL=("${P_LINES[@]}")
+}
+
+build_footer() { # W -> FOOTER_LINES
+    local w=$1 iw=$(( w - 2 )) l
+    l=" "
+    ((PAUSED)) && l+="${C_WARN}PAUSED${R}  "
+    ((STALE)) && l+="${C_BAD}link lost${R}  "
+    l+="${C_LBL}q${R} quit  ${C_LBL}p${R} pause  ${C_LBL}+-${R} interval  ${C_LBL}r${R} rescan  ${C_LBL}h${R} help"
+    rep '─' "$iw"
+    FOOTER_LINES=("${C_BRD}┌${REPLY}┐${R}")
+    fit "$l" "$iw"
+    FOOTER_LINES+=("${C_BRD}│${R}${REPLY}${C_BRD}│${R}")
+    rep '─' "$iw"
+    FOOTER_LINES+=("${C_BRD}└${REPLY}┘${R}")
+}
+
+# -------------------------------------------------------------------- frame
+# Vertical layout, wide terminal (>=104 cols):
+#
+#   header
+#   ┌ CPU (package, usage, pwr/fan/clk, per-core grid) ┐┌ GPU              ┐
+#   │                                                 ││ MEMORY           │
+#   │                                                 ││ NETWORK          │
+#   └─────────────────────────────────────────────────┘└──────────────────┘
+#   ┌ SENSORS (full width, everything not shown above) ───────────────────┐
+#   footer
+#
+# Heights are allocated exactly: the right column is split top-down by
+# priority (GPU, memory, network) and the sensors strip takes a fixed share
+# of the remaining rows, so no panel can overrun its neighbour.
+
+alloc_right() { # ROWS -> GPUH MEMH NETH  (sums to ROWS exactly)
+    # Right column priority: GPU needs ~9 rows to show all its readings plus a
+    # graph, memory 6, and the rest goes to the network graphs.
+    local r=$1
+    GPUH=0 MEMH=0 NETH=0
+    if ((r < 6)); then GPUH=$r; return 0; fi
+    GPUH=$(( r * 45 / 100 ))
+    ((GPUH > 12)) && GPUH=12
+    ((GPUH < 7)) && GPUH=7
+    # ram + swap + virt + a graph row, so 7
+    MEMH=7
+    ((r < 20)) && MEMH=6
+    ((r < 16)) && MEMH=4
+    if ((r < 12)); then
+        MEMH=0
+        GPUH=$(( r * 55 / 100 ))
+        ((GPUH < 6)) && GPUH=6
+    fi
+    NETH=$(( r - GPUH - MEMH ))
+    if ((NETH < 3)); then
+        NETH=0
+        MEMH=$(( r - GPUH ))
+        ((MEMH < 0)) && { MEMH=0; GPUH=$r; }
+    fi
+    if ((MEMH < 0)); then MEMH=0; fi
+    return 0
+}
+
+render_frame() { # W H -> FRAME_LINES
+    local w=$1 h=$2 bodyh sensorh upper
+    # 40x12 is the smallest frame that still fits header, footer and a panel.
+    # Clamping here as well as at the terminal probe keeps every caller -- and
+    # any future one -- inside the same contract.
+    ((w < 40)) && w=40
+    ((h < 12)) && h=12
+    build_header "$w"
+    bodyh=$(( h - 6 ))
+    ((bodyh < 5)) && bodyh=5
+    local -a out=("${HEADER_LINES[@]}")
+
+    if ((w >= 104 && bodyh >= 14)); then
+        sensorh=$(( bodyh * 32 / 100 ))
+        ((sensorh < 6)) && sensorh=6
+        ((sensorh > 14)) && sensorh=14
+        ((sensorh > bodyh - 10)) && sensorh=$(( bodyh - 10 ))
+        ((sensorh < 4)) && sensorh=4
+        upper=$(( bodyh - sensorh ))
+
+        local lw=$(( w * 46 / 100 ))
+        ((lw < 48)) && lw=48
+        local rw=$(( w - lw ))
+
+        build_cpu "$lw" "$upper"
+        local -a L=("${CPUL[@]}")
+
+        alloc_right "$upper"
+        build_gpu "$rw" "$GPUH"; local -a Rr=("${GPUL[@]}")
+        build_mem "$rw" "$MEMH"; Rr+=("${MEML[@]}")
+        build_net "$rw" "$NETH"; Rr+=("${NETL[@]}")
+        local i n=${#L[@]}
+        ((${#Rr[@]} < n)) && n=${#Rr[@]}
+        for ((i = 0; i < n; i++)); do out+=("${L[i]}${Rr[i]}"); done
+
+        build_others "$w" "$sensorh"
+        out+=("${OTHL[@]}")
+    elif ((bodyh >= 8)); then
+        # medium: CPU over memory, sensors dropped
+        local cpuh=$(( bodyh - 4 ))
+        ((cpuh < 6)) && cpuh=6
+        build_cpu "$w" "$cpuh"; out+=("${CPUL[@]}")
+        build_mem "$w" "$(( bodyh - cpuh ))"; out+=("${MEML[@]}")
+    else
+        build_cpu "$w" "$bodyh"; out+=("${CPUL[@]}")
+    fi
+
+    build_footer "$w"
+    out+=("${FOOTER_LINES[@]}")
+    FRAME_LINES=("${out[@]}")
+}
+
+# ---------------------------------------------------------------------- TUI
+TERM_RESTORED=0
+restore_term() {
+    ((TERM_RESTORED)) && return
+    TERM_RESTORED=1
+    printf '%s[0m%s[?25h%s[?1049l' "$E" "$E" "$E"
+    stty echo 2>/dev/null
+    cleanup_tmp
+}
+
+refresh() { # poll + detect + record history (no-op while paused)
+    if ! poll_read; then
+        # the API omits readings it is not monitoring, so a vanished value must
+        # never be shown as if it were live; once the link has been down for a
+        # few polls, drop the numbers instead of freezing the last good frame
+        if ((LINE_LOST >= 3)); then
+            S_SEN=() S_NAM=() S_TYP=() S_VAL=() S_UNI=()
+            detect
+        fi
+        return 1
+    fi
+    detect
+    sample_histories
+    return 0
+}
+
+sample_histories() { # record one sample per polled quantity
+    local v
+    reading "$i_temp" 0; [[ $VALUE != "--" ]] && hpush H_CT "${VALUE%.*}"
+    reading "$i_use"  0; [[ $VALUE != "--" ]] && hpush H_CP "${VALUE%.*}"
+    reading "$g_temp" 0; [[ $VALUE != "--" ]] && hpush H_GT "${VALUE%.*}"
+    reading "$m_load" 0
+    if [[ $VALUE == "--" ]]; then
+        reading "$m_used" 0; local mu=$VALUE
+        reading "$m_total" 0; local mt=$VALUE
+        if [[ $mu != "--" && $mt != "--" ]] && ((mt > 0)); then VALUE=$(( mu * 100 / mt )); fi
+    fi
+    [[ $VALUE =~ ^[0-9]+$ ]] && hpush H_ML "$VALUE"
+    toint "${S_VAL[n_dn]:-}"; hpush H_DN "$REPLY"
+    toint "${S_VAL[n_up]:-}"; hpush H_UP "$REPLY"
+    return 0
+}
+
+show_help() { # W H - overlay the key map, wait for a key
+    local w=$1 h=$2
+    local -a raw=(
+        "keys|"
+        "k|q          quit"
+        "k|p          pause / resume polling"
+        "k|+  -       poll interval: 1s steps, 100ms steps below 1s"
+        "k|r          reload the sensor database and re-detect sensors"
+        "k|h          this help"
+        "k|"
+        "h|about"
+        "t|"
+        "t|hwapiTop polls /api/sensors/read and matches every value against the sensor database from /api/sensors/sdb, so units and grouping come from the server instead of guesses in the client."
+        "t|"
+        "t|A reading HWiNFO is not monitoring is omitted from the response. It is shown as -- rather than left at its last value, and after three failed polls every reading is dropped instead of frozen."
+    )
+
+    local bw=$(( w - 8 ))
+    ((bw > 70)) && bw=70
+    ((bw < 32)) && bw=$(( w - 2 ))
+    local inner=$(( bw - 2 ))
+
+    # wrap to the panel, then draw
+    local -a body=()
+    local item kind text line
+    for item in "${raw[@]}"; do
+        kind=${item%%|*}
+        text=${item#*|}
+        if [[ -z $text ]]; then body+=(""); continue; fi
+        while ((${#text} > inner - 2)); do
+            line=${text:0:$((inner - 2))}
+            # break on the last space so words are not cut in half
+            if [[ $line == *" "* ]]; then
+                line=${line% *}
+                body+=("${line}")
+                text=${text:${#line}+1}
+            else
+                body+=("$line")
+                text=${text:$((inner - 2))}
+            fi
+        done
+        body+=("$text")
+    done
+
+    local ph=$(( ${#body[@]} + 2 ))
+    local top=$(( (h - ph) / 2 ))
+    ((top < 0)) && top=0
+    local left=$(( (w - bw) / 2 ))
+    ((left < 0)) && left=0
+    rep ' ' "$left"; local pad=$REPLY
+
+    local i buf="${E}[H"
+    for ((i = 0; i < h; i++)); do buf+="${E}[$((i + 1));1H${E}[K"; done
+    local title=" help "
+    local rule=$(( bw - 3 - ${#title} ))
+    ((rule < 1)) && rule=1
+    rep '─' "$rule"
+    buf+="${E}[$((top + 1));1H${pad}${C_BRD}┌─${C_TTL}${title}${C_BRD}${REPLY}┐${R}"
+    for ((i = 0; i < ${#body[@]}; i++)); do
+        fit " ${body[i]}" "$inner"
+        buf+="${E}[$((top + i + 2));1H${pad}${C_BRD}│${R}${REPLY}${C_BRD}│${R}"
+    done
+    rep '─' $(( bw - 2 ))
+    buf+="${E}[$((top + ${#body[@]} + 2));1H${pad}${C_BRD}└${REPLY}┘${R}"
+    printf '%s%s' "$buf" "$R"
+    read -rsn1 -t 30 _ || true
+    printf '%s[2J' "$E"
+}
+
+run_tui() {
+    printf '%s[?1049h%s[?25l%s[2J' "$E" "$E" "$E"
+    stty -echo 2>/dev/null
+    trap 'restore_term; exit 0' INT TERM
+    trap 'restore_term' EXIT
+
+    local next=0 now key wait_f i line
+    while :; do
+        now=${EPOCHREALTIME}      # seconds.micros, bash 5 builtin clock
+        if ((!PAUSED && ${now%.*} >= next)); then
+            refresh
+            next=$(awk -v e="${now%.*}" -v ms="$INT_MS" 'BEGIN{printf "%d", e + ms/1000 + 0.5}')
+        fi
+        get_size
+        render_frame "$W" "$H"
+        local buf="${E}[H"
+        for ((i = 0; i < H; i++)); do
+            line=${FRAME_LINES[i]:-}
+            buf+="${E}[$((i + 1));1H${line}${E}[K"
+        done
+        printf '%s%s' "$buf" "$R"
+
+        # key wait: sub-second waits need a fractional -t so 100ms polling
+        # stays responsive; read -t accepts decimals in bash 4+
+        wait_f=30
+        ((!PAUSED)) && wait_f=$(awk -v n="$next" -v e="$EPOCHREALTIME" 'BEGIN{d=n-e; printf "%.2f", (d<0.03?0.03:d)}')
+        if read -rsn1 -t "$wait_f" key; then
+            case $key in
+                q|Q) break ;;
+                p|P) PAUSED=$(( !PAUSED )); ((PAUSED)) || next=0 ;;
+                +|=)
+                    # below 1s step by 100ms, above by 1s (INT_MS+=100 inside
+                    # (( )) reads as a variable named INT_MS+=100 -> use $(( )))
+                    if ((INT_MS < 1000)); then INT_MS=$((INT_MS + 100)); else INT_MS=$((INT_MS + 1000)); fi
+                    ((INT_MS > 60000)) && INT_MS=60000
+                    iv_show; next=0 ;;
+                -|_)
+                    if ((INT_MS <= 1000)); then INT_MS=$((INT_MS - 100)); else INT_MS=$((INT_MS - 1000)); fi
+                    ((INT_MS < 100)) && INT_MS=100
+                    iv_show; next=0 ;;
+                r|R) load_sdb; refresh; next=0 ;;
+                h|H) show_help "$W" "$H" ;;
+            esac
+        fi
+    done
+}
+
+# -------------------------------------------------------------- plain modes
+print_snapshot() {
+    local ts tv uv gv mstr nstr
+    ts=$(date +%H:%M:%S)
+    printf '%s  %s  poll %ss%s\n' "$ts" "$BASE_URL" "$INTERVAL" "${SRV_VER:+  api v$SRV_VER}"
+    val_of "$i_temp" >/dev/null; fmtval "$REPLY" 1; tv=${REPLY:-?}
+    val_of "$i_use"  >/dev/null; fmtval "$REPLY" 1; uv=${REPLY:-?}
+    val_of "$g_temp" >/dev/null; fmtval "$REPLY" 1; gv=${REPLY:-?}
+    local oname="${D_CPU:-unknown sensor}"
+    disp_name "$oname"
+    printf 'cpu   %6s°C  %5s%%  %s\n' "$tv" "$uv" "$REPLY"
+    local mu mt mp
+    val_of "$m_used"  >/dev/null; fmtval "$REPLY" 0; mu=${REPLY:-?}
+    if ((m_total == -3)); then mt=$M_TOTAL_V; else val_of "$m_total" >/dev/null; fmtval "$REPLY" 0; mt=${REPLY:-?}; fi
+    val_of "$m_load"  >/dev/null; fmtval "$REPLY" 0; mp=${REPLY:-?}
+    printf 'mem   %s/%s MB  %s%%\n' "$mu" "$mt" "$mp"
+    printf 'gpu   %6s°C\n' "$gv"
+    local dv du uv2 uu
+    val_of "$n_dn" >/dev/null; fmtval "$REPLY" 1; dv=${REPLY:-?}; unit_of "$n_dn"; du=$REPLY
+    val_of "$n_up" >/dev/null; fmtval "$REPLY" 1; uv2=${REPLY:-?}; unit_of "$n_up"; uu=$REPLY
+    printf 'net   down %s %s  up %s %s\n' "$dv" "$du" "$uv2" "$uu"
+    [[ -n $LAST_ERR ]] && printf 'error %s\n' "$LAST_ERR"
+    return 0
+}
+
+print_list() {
+    # machine-oriented dump: original server names + the short English label
+    # that the UI shows, so a reading can be traced between both views
+    local i tname sn dn
+    printf '%-34s %-34s %-6s %-10s %-6s %s\n' "SENSOR" "READING" "TYPE" "VALUE" "UNIT" "LABEL"
+    for i in "${!S_NAM[@]}"; do
+        case ${S_TYP[i]} in
+            0) tname=none ;; 1) tname=temp ;; 2) tname=volt ;; 3) tname=fan ;;
+            4) tname=amp ;;  5) tname=pwr ;;  6) tname=clk ;; 7) tname=use ;;
+            8) tname=other ;; *) tname="t${S_TYP[i]}" ;;
+        esac
+        short_name "${S_NAM[i]}"; sn=$REPLY
+        disp_name "${S_SEN[i]}"; dn=$REPLY
+        printf '%-34.34s %-34.34s %-6s %-10.10s %-6.6s %s\n' \
+            "${S_SEN[i]}" "${S_NAM[i]}" "$tname" "${S_VAL[i]}" "${S_UNI[i]}" "$dn | $sn"
+    done
+}
+
+# refresh the display form of the interval from the internal ms value
+iv_show() {
+    INTERVAL=$(printf '%d.%03d' $(( INT_MS / 1000 )) $(( INT_MS % 1000 )))
+    INTERVAL=${INTERVAL%.000}    # 2.000 -> 2, keep 0.300 / 1.500 as-is
+}
+
+# --------------------------------------------------------------------- main
+if ! connect; then
+    printf '%s: cannot reach the HWiNFO API at %s\n' "$APP" "$URL_ARG" >&2
+    printf '  tried: %s\n' "${CANDIDATES[*]}" >&2
+    printf '  last error: %s\n' "${CONNECT_ERR:-unknown}" >&2
+    # curl exit codes tell apart "nothing answered" from "answered wrongly",
+    # and the fix is completely different for each
+    case ${CONN_RC:-} in
+        7)
+            cat >&2 <<'EOF'
+  hints: connection refused - the host is up but nothing listens on that port.
+    - start the server in HWiNFO's Remote Center (Start button) and use the
+      exact address it shows
+    - check the port: HWiNFO defaults to 8080, but the Remote Center may use
+      another one
+EOF
+            ;;
+        28)
+            cat >&2 <<'EOF'
+  hints: connection timed out - no reply at all, so packets are being dropped.
+    - the address or port is probably wrong, or the server binds only to its
+      own loopback interface instead of the LAN
+    - check the firewall on the machine running HWiNFO (Windows Defender
+      usually needs an inbound rule for the Remote Center port)
+    - check that both machines are on the same network and that the IP has
+      not changed (DHCP)
+EOF
+            ;;
+        6|35|51|60)
+            cat >&2 <<'EOF'
+  hints: TLS problem - the certificate is not trusted or the scheme is wrong.
+    - the tool accepts self-signed certificates by default; if you passed
+      --verify, drop it or install the certificate
+    - try the other scheme explicitly: --url http://<host>:<port>
+EOF
+            ;;
+        *)
+            cat >&2 <<'EOF'
+  hints:
+    - start the server in HWiNFO's Remote Center (Start button) and note its URL
+    - pass the exact address, e.g. --url http://192.168.1.50:8080
+    - a TLS error means the certificate is not trusted; this tool skips
+      verification by default (add --verify to require a trusted cert)
+    - connection refused means nothing listens there (IP, port, firewall)
+    - a timeout means nothing answered at all (wrong IP, firewall, or the
+      server is bound to loopback only)
+EOF
+            ;;
+    esac
+    exit 1
+fi
+
+if ! load_sdb; then
+    printf '%s: warning: sensor database unavailable (%s); units will be missing\n' \
+        "$APP" "$LAST_ERR" >&2
+fi
+
+case $MODE in
+    list)
+        refresh || { printf '%s: %s\n' "$APP" "${LAST_ERR:-read failed}" >&2; exit 1; }
+        print_list
+        ;;
+    once)
+        refresh || { printf '%s: %s\n' "$APP" "${LAST_ERR:-read failed}" >&2; exit 1; }
+        print_snapshot
+        ;;
+    render)
+        W=${RENDER_SPEC%x*} H=${RENDER_SPEC#*x}
+        [[ $W =~ ^[0-9]+$ ]] || W=80
+        [[ $H =~ ^[0-9]+$ ]] || H=24
+        # a single poll would leave every graph collapsed into one wall of
+        # blocks, so warm the histories with a few quick samples first
+        for ((_warm = 0; _warm < 40; _warm++)); do
+            refresh || break
+            sleep 0.03
+        done
+        detect
+        render_frame "$W" "$H"
+        local_i=0
+        for local_i in "${FRAME_LINES[@]}"; do printf '%s\n' "$local_i"; done
+        ;;
+    tui)
+        if [[ ! -t 1 ]]; then
+            printf '%s: stdout is not a terminal; use --once or --list\n' "$APP" >&2
+            exit 1
+        fi
+        refresh || true
+        run_tui
+        ;;
+esac
+cleanup_tmp
+exit 0
